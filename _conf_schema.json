@@ -141,10 +141,33 @@
       },
       "max_file_size_mb": {
         "description": "最大文件大小（MB）",
-        "hint": "超过此大小的视频文件将被拒绝处理。Gemini 内嵌传输的总请求体上限为 20MB，base64 编码会膨胀约 33%，故默认 15MB 较稳妥；更大的视频请压缩或改用 Files API 方案。",
+        "hint": "文件总大小上限，超过直接拒绝。Files API 免费层上限 2GB，建议 ≤ 200MB。",
         "type": "int",
-        "slider": { "min": 1, "max": 50, "step": 1 },
-        "default": 15
+        "slider": { "min": 1, "max": 512, "step": 8 },
+        "default": 100
+      },
+      "max_inline_size_mb": {
+        "description": "内嵌传输上限（MB）",
+        "hint": "小于等于此大小的视频用内嵌传输（请求体含 base64 膨胀约 33%，官方总请求体上限 20MB）；超过则走 Files API。",
+        "type": "int",
+        "slider": { "min": 1, "max": 19, "step": 1 },
+        "default": 15,
+        "collapsed": true
+      },
+      "use_files_api": {
+        "description": "启用 Files API（大视频上传）",
+        "hint": "超过内嵌上限的视频通过官方 Files API（resumable 上传）处理，免费层单文件 2GB。仅官方接口支持；OpenAI 兼容中转站通常不支持，请关闭。",
+        "type": "bool",
+        "default": true,
+        "collapsed": true
+      },
+      "max_cached_files": {
+        "description": "每会话缓存视频数上限",
+        "hint": "每个会话最多缓存多少个视频条目，超出后自动丢弃最旧的，防止长会话内存膨胀。",
+        "type": "int",
+        "slider": { "min": 5, "max": 200, "step": 5 },
+        "default": 50,
+        "collapsed": true
       },
       "supported_formats": {
         "description": "支持的视频格式",

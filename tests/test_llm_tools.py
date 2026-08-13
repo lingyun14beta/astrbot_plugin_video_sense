@@ -14,7 +14,7 @@ from llm_tools import resolve_video_ref, run_video_analysis_from_path
 @pytest.fixture
 def mock_client():
     client = MagicMock(spec=GeminiClient)
-    client.analyze = AsyncMock(return_value="这是一段精彩的视频。")
+    client.analyze_video = AsyncMock(return_value="这是一段精彩的视频。")
     client.close = AsyncMock()
     return client
 
@@ -22,22 +22,22 @@ def mock_client():
 class TestRunVideoAnalysisFromPath:
     async def test_success(self, sample_video_path, mock_client):
         result = await run_video_analysis_from_path(
-            str(sample_video_path), 20, mock_client
+            str(sample_video_path), 100, mock_client
         )
         assert "精彩的视频" in result
-        mock_client.analyze.assert_called_once()
+        mock_client.analyze_video.assert_called_once()
 
     async def test_file_not_found(self, mock_client):
         result = await run_video_analysis_from_path(
-            "/nonexistent.mp4", 20, mock_client
+            "/nonexistent.mp4", 100, mock_client
         )
         assert "视频分析失败" in result
-        mock_client.analyze.assert_not_called()
+        mock_client.analyze_video.assert_not_called()
 
     async def test_api_error(self, sample_video_path, mock_client):
-        mock_client.analyze.side_effect = GeminiClientError("API 超时")
+        mock_client.analyze_video.side_effect = GeminiClientError("API 超时")
         result = await run_video_analysis_from_path(
-            str(sample_video_path), 20, mock_client
+            str(sample_video_path), 100, mock_client
         )
         assert "API 超时" in result
 

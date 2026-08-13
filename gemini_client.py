@@ -1,10 +1,19 @@
-"""Gemini 视频分析客户端，同时支持官方 API 和 OpenAI 兼容中转站。"""
+"""Gemini 视频分析客户端，同时支持官方 API 和 OpenAI 兼容中转站。
+
+传输方式：
+- 内嵌传输（inline_data）：文件 ≤ max_inline_size_mb，总请求体受官方 20MB 限制。
+- Files API（官方推荐，免费层 2GB）：文件超过内嵌上限时使用 resumable 协议上传，
+  再通过 file_data 引用，支持更长的视频。
+  参考：https://ai.google.dev/gemini-api/docs/files
+"""
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import random
+from pathlib import Path
 from urllib.parse import urlparse
 
 import aiohttp
@@ -18,10 +27,14 @@ _OFFICIAL_HOSTS: frozenset[str] = frozenset(
 
 _DEFAULT_BASE_URL = "https://generativelanguage.googleapis.com"
 _MAX_BACKOFF = 8.0
+_MB = 1024 * 1024
 
 _HTTP_OK = 200
 _HTTP_4XX_MIN = 400
 _HTTP_5XX_MIN = 500
+
+_FILE_STATE_ACTIVE = "ACTIVE"
+_FILE_STATE_FAILED = "FAILED"
 
 
 class GeminiClientError(Exception):
@@ -41,8 +54,10 @@ class GeminiClient:
         model: str,
         system_prompt: str,
         base_url: str = "",
-        timeout: int = 180,
+        timeout: int = 300,
         retry_times: int = 2,
+        max_inline_size_mb: int = 15,
+        use_files_api: bool = True,
     ) -> None:
         self._api_key = api_key.strip()
         self._model = self._normalize_model(model)
@@ -50,21 +65,153 @@ class GeminiClient:
         self._base_url = (base_url or "").strip().rstrip("/")
         self._timeout = timeout
         self._retry_times = retry_times
+        self._max_inline_size_mb = max(0, int(max_inline_size_mb))
+        self._use_files_api = bool(use_files_api)
         self._session: aiohttp.ClientSession | None = None
 
-    async def analyze(self, video_b64: str, mime_type: str) -> str:
-        """分析视频，返回 Gemini 的文字描述。
+    # ------------------------------------------------------------------
+    # 对外接口
+    # ------------------------------------------------------------------
+
+    async def analyze_video(self, video) -> str:
+        """分析一个视频文件（VideoFile），自动选择传输方式。
+
+        Args:
+            video: 具有 path / mime_type / filename / size_bytes 属性的对象。
 
         Raises:
             GeminiClientError: 调用失败或返回为空。
         """
+        inline_limit = self._max_inline_size_mb * _MB
+        if video.size_bytes <= inline_limit:
+            return await self.analyze(
+                await self._read_base64(video.path),
+                video.mime_type,
+            )
+        if self._use_files_api:
+            file_uri = await self.upload_file(video.path, video.mime_type, video.filename)
+            return await self.analyze_file(file_uri, video.mime_type)
+        size_mb = video.size_bytes / _MB
+        raise GeminiClientError(
+            f"文件 {size_mb:.1f} MB 超过内嵌上限 {self._max_inline_size_mb} MB，"
+            "且未启用 Files API，请压缩视频或在配置中开启 Files API。",
+        )
+
+    async def analyze(self, video_b64: str, mime_type: str) -> str:
+        """内嵌传输：分析视频，返回 Gemini 的文字描述。"""
+        self._require_api_key()
+        return await self._request_text(
+            self._build_url(),
+            self._build_headers(),
+            self._build_payload(video_b64, mime_type),
+        )
+
+    async def analyze_file(self, file_uri: str, mime_type: str) -> str:
+        """Files API：通过已上传文件的 URI 分析视频。"""
+        self._require_api_key()
+        return await self._request_text(
+            self._build_url(),
+            self._build_headers(),
+            self._build_file_payload(file_uri, mime_type),
+        )
+
+    async def upload_file(self, file_path: str, mime_type: str, display_name: str = "") -> str:
+        """通过 Files API resumable 协议上传文件，返回可引用的 file_uri。
+
+        流程（官方文档）：
+        1. POST /upload/v1beta/files 发起上传（X-Goog-Upload-Protocol: resumable，
+           X-Goog-Upload-Command: start），从响应头 X-Goog-Upload-URL 获取上传地址。
+        2. PUT 上传地址写入文件字节（X-Goog-Upload-Command: upload, finalize）。
+        3. 轮询 GET /v1beta/files/{name} 直到状态 ACTIVE。
+
+        Raises:
+            GeminiClientError: 上传或处理失败。
+        """
+        self._require_api_key()
+
+        p = Path(file_path)
+        if not p.is_file():
+            raise GeminiClientError(f"文件不存在或无法访问：{file_path}")
+
+        size = p.stat().st_size
+        session = await self._get_session()
+
+        # 1) 初始化上传
+        start_headers = {
+            **self._build_headers(),
+            "X-Goog-Upload-Protocol": "resumable",
+            "X-Goog-Upload-Command": "start",
+            "X-Goog-Upload-Header-Content-Length": str(size),
+            "X-Goog-Upload-Header-Content-Type": mime_type,
+        }
+        metadata = {
+            "file": {
+                "display_name": display_name or p.name,
+                "mime_type": mime_type,
+            },
+        }
+        async with session.post(
+            self._build_upload_url(), headers=start_headers, json=metadata
+        ) as resp:
+            if resp.status != _HTTP_OK:
+                raw = await resp.text()
+                msg = _extract_error_message(raw) or f"HTTP {resp.status}"
+                raise GeminiClientError(f"上传初始化失败（{resp.status}）：{msg}")
+            upload_url = resp.headers.get("X-Goog-Upload-URL", "").strip()
+        if not upload_url:
+            raise GeminiClientError("上传初始化失败：响应缺少 X-Goog-Upload-URL。")
+
+        # 2) 写入文件字节
+        data = await asyncio.to_thread(p.read_bytes)
+        put_headers = {
+            **self._build_headers(),
+            "Content-Length": str(len(data)),
+            "X-Goog-Upload-Offset": "0",
+            "X-Goog-Upload-Command": "upload, finalize",
+        }
+        async with session.put(upload_url, headers=put_headers, data=data) as resp:
+            raw = await resp.text()
+            if resp.status != _HTTP_OK:
+                msg = _extract_error_message(raw) or f"HTTP {resp.status}"
+                raise GeminiClientError(f"上传失败（{resp.status}）：{msg}")
+            try:
+                file_info = json.loads(raw)
+            except json.JSONDecodeError as e:
+                raise GeminiClientError(f"上传响应解析失败：{e}") from e
+
+        f = file_info.get("file") or {}
+        name = f.get("name", "")
+        uri = f.get("uri", "")
+        state = f.get("state", "")
+        if not name or not uri:
+            raise GeminiClientError("上传响应缺少文件信息（name/uri）。")
+        if state == _FILE_STATE_FAILED:
+            raise GeminiClientError(f"文件处理失败：{f.get('error')}")
+        if state == _FILE_STATE_ACTIVE:
+            return uri
+
+        # 3) 轮询直到处理完成
+        return await self._wait_file_active(name, uri)
+
+    async def close(self) -> None:
+        """关闭底层 aiohttp session。"""
+        if self._session and not self._session.closed:
+            await self._session.close()
+            self._session = None
+
+    # ------------------------------------------------------------------
+    # 内部实现
+    # ------------------------------------------------------------------
+
+    def _require_api_key(self) -> None:
         if not self._api_key:
             raise GeminiClientError("未配置 API Key，请在插件设置中填写。")
 
-        url = self._build_url()
-        headers = self._build_headers()
-        payload = self._build_payload(video_b64, mime_type)
+    async def _read_base64(self, file_path: str) -> str:
+        raw = await asyncio.to_thread(Path(file_path).read_bytes)
+        return base64.b64encode(raw).decode("ascii")
 
+    async def _request_text(self, url: str, headers: dict, payload: dict) -> str:
         last_error: str = "未知错误"
         for attempt in range(self._retry_times + 1):
             try:
@@ -76,14 +223,33 @@ class GeminiClient:
                 if attempt < self._retry_times:
                     wait = min(_MAX_BACKOFF, 2**attempt) + random.uniform(0, 0.3)
                     await asyncio.sleep(wait)
-
         raise GeminiClientError(last_error)
 
-    async def close(self) -> None:
-        """关闭底层 aiohttp session。"""
-        if self._session and not self._session.closed:
-            await self._session.close()
-            self._session = None
+    async def _wait_file_active(self, name: str, uri: str, timeout: int = 180) -> str:
+        get_url = f"{self._effective_base()}/v1beta/{name}"
+        session = await self._get_session()
+        deadline = asyncio.get_event_loop().time() + timeout
+        delay = 1.0
+        while True:
+            async with session.get(get_url, headers=self._build_headers()) as resp:
+                raw = await resp.text()
+                if resp.status != _HTTP_OK:
+                    msg = _extract_error_message(raw) or f"HTTP {resp.status}"
+                    raise GeminiClientError(f"查询文件状态失败（{resp.status}）：{msg}")
+                try:
+                    data = json.loads(raw)
+                except json.JSONDecodeError as e:
+                    raise GeminiClientError(f"查询文件状态响应解析失败：{e}") from e
+            f = data.get("file") or {}
+            state = f.get("state", "")
+            if state == _FILE_STATE_ACTIVE:
+                return uri
+            if state == _FILE_STATE_FAILED:
+                raise GeminiClientError(f"文件处理失败：{f.get('error')}")
+            if asyncio.get_event_loop().time() >= deadline:
+                raise GeminiClientError("等待文件处理超时，请稍后重试。")
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 5.0)
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -109,6 +275,14 @@ class GeminiClient:
                 break
         return f"{base}/v1beta/models/{self._model}:generateContent"
 
+    def _build_upload_url(self) -> str:
+        base = self._effective_base()
+        for suffix in ("/v1/chat/completions", "/v1beta/openai", "/v1beta", "/v1"):
+            if base.endswith(suffix):
+                base = base[: -len(suffix)]
+                break
+        return f"{base}/upload/v1beta/files"
+
     def _build_headers(self) -> dict[str, str]:
         if self._is_official():
             return {
@@ -133,6 +307,27 @@ class GeminiClient:
                             "inline_data": {
                                 "mime_type": mime_type,
                                 "data": video_b64,
+                            },
+                        },
+                        {"text": "请分析这段视频。"},
+                    ],
+                },
+            ],
+        }
+
+    def _build_file_payload(self, file_uri: str, mime_type: str) -> dict:
+        return {
+            "system_instruction": {
+                "parts": [{"text": self._system_prompt}],
+            },
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [
+                        {
+                            "file_data": {
+                                "mime_type": mime_type,
+                                "file_uri": file_uri,
                             },
                         },
                         {"text": "请分析这段视频。"},

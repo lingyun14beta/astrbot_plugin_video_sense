@@ -79,7 +79,19 @@ class VideoSensePlugin(Star):
 
     @property
     def _max_size_mb(self) -> int:
-        return int(self._analysis_cfg.get("max_file_size_mb", 15))
+        return int(self._analysis_cfg.get("max_file_size_mb", 100))
+
+    @property
+    def _max_inline_mb(self) -> int:
+        return int(self._analysis_cfg.get("max_inline_size_mb", 15))
+
+    @property
+    def _use_files_api(self) -> bool:
+        return bool(self._analysis_cfg.get("use_files_api", True))
+
+    @property
+    def _max_cached_files(self) -> int:
+        return max(1, int(self._analysis_cfg.get("max_cached_files", 50)))
 
     @property
     def _system_prompt(self) -> str:
@@ -143,7 +155,9 @@ class VideoSensePlugin(Star):
             model=model,
             system_prompt=sp,
             base_url=provider.get("base_url", ""),
-            timeout=int(provider.get("timeout", 180)),
+            timeout=int(provider.get("timeout", 300)),
+            max_inline_size_mb=self._max_inline_mb,
+            use_files_api=self._use_files_api,
         )
 
     # ------------------------------------------------------------------
@@ -200,6 +214,15 @@ class VideoSensePlugin(Star):
 
         if self._debug and new_items:
             logger.info("[VideoSense] 缓存完成：%d 个视频文件", len(new_items))
+
+        # 缓存上限裁剪：保留最近的 N 个，避免长会话无限膨胀
+        max_cached = self._max_cached_files
+        if len(items) > max_cached:
+            overflow = len(items) - max_cached
+            async with self._lock:
+                del items[:overflow]
+            if self._debug:
+                logger.info("[VideoSense] 缓存超限，裁剪 %d 个最旧条目", overflow)
 
         yield
 
@@ -334,14 +357,17 @@ class VideoSensePlugin(Star):
     # ------------------------------------------------------------------
 
     @llm_tool("analyze_current_video")
-    async def analyze_current_video(self, event: AstrMessageEvent):
+    async def analyze_current_video(self, event: AstrMessageEvent, question: str = ""):
         """分析当前消息或引用消息中的视频文件。
         当用户直接发送了视频并希望 bot 理解、评价时调用。
+
+        Args:
+            question(str, optional): 用户对视频的具体追问，如"这个视频在干嘛？"
         """
         if not self._analysis_cfg.get("enable_llm_tool", True):
             return "视频分析功能未启用。"
 
-        client = self._make_client()
+        client = self._make_client(question)
         try:
             result = await run_video_analysis(
                 event,
@@ -431,7 +457,7 @@ class VideoSensePlugin(Star):
                 self._supported_formats,
                 self._max_size_mb,
             )
-            result = await client.analyze(video.b64, video.mime_type)
+            result = await client.analyze_video(video)
         except VideoError as e:
             return f"文件处理失败：{e}"
         except GeminiClientError as e:

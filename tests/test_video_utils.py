@@ -10,7 +10,7 @@ import pytest
 from video_utils import (
     VideoError,
     _get_ext,
-    _read_and_validate,
+    _validate,
     download_video_file,
     load_video_from_path,
     resolve_component_ref,
@@ -89,46 +89,48 @@ class TestResolveComponentRef:
         assert url == ""
 
 
-class TestReadAndValidate:
+class TestValidate:
     async def test_valid_file(self, sample_video_path):
-        result = await _read_and_validate(
-            str(sample_video_path), "mp4", 20, "test.mp4"
+        result = await _validate(
+            str(sample_video_path), "mp4", 100, "test.mp4"
         )
+        assert result.path == str(sample_video_path)
         assert result.filename == "test.mp4"
         assert result.mime_type == "video/mp4"
-        assert result.b64
+        assert result.size_bytes == sample_video_path.stat().st_size
 
     async def test_mov_mime(self, sample_mov_path):
-        result = await _read_and_validate(
-            str(sample_mov_path), "mov", 20, "clip.mov"
+        result = await _validate(
+            str(sample_mov_path), "mov", 100, "clip.mov"
         )
         assert result.mime_type == "video/mov"
 
     async def test_unsupported_extension_uses_generic_mime(self, temp_dir):
         p = temp_dir / "test.xyz"
         p.write_bytes(b"\x00" * 100)
-        result = await _read_and_validate(str(p), "xyz", 20, "test.xyz")
+        result = await _validate(str(p), "xyz", 100, "test.xyz")
         assert result.mime_type == "video/xyz"
 
     async def test_file_too_large(self, sample_large_video_path):
         with pytest.raises(VideoError, match="超过限制"):
-            await _read_and_validate(
+            await _validate(
                 str(sample_large_video_path), "mp4", 1, "large.mp4"
             )
 
     async def test_file_not_exists(self):
         with pytest.raises(VideoError, match="不存在"):
-            await _read_and_validate("/nonexistent/file.mp4", "mp4", 20, "file.mp4")
+            await _validate("/nonexistent/file.mp4", "mp4", 100, "file.mp4")
 
 
 class TestLoadVideoFromPath:
     async def test_valid(self, sample_video_path):
-        result = await load_video_from_path(str(sample_video_path), 20)
-        assert result.b64
+        result = await load_video_from_path(str(sample_video_path), 100)
+        assert result.path == str(sample_video_path)
+        assert result.mime_type == "video/mp4"
 
     async def test_file_not_found(self):
         with pytest.raises(VideoError, match="不存在"):
-            await load_video_from_path("/nonexistent.mp4", 20)
+            await load_video_from_path("/nonexistent.mp4", 100)
 
 
 class TestDownloadVideoFile:

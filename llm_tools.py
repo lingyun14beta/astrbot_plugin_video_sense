@@ -16,14 +16,14 @@ async def run_video_analysis(
     max_size_mb: int,
     client: GeminiClient,
 ) -> str:
-    """从当前 event 的 File 组件执行视频分析。"""
+    """从当前 event 的 File 组件执行视频分析（自动选择内嵌/Files API 传输）。"""
     file_comp = extract_file_component(event)
     if file_comp is None:
         return "当前消息中没有找到视频文件，无法进行分析。"
 
     try:
         video = await load_video(file_comp, supported_formats, max_size_mb)
-        result = await client.analyze(video.b64, video.mime_type)
+        result = await client.analyze_video(video)
     except (VideoError, GeminiClientError) as e:
         return f"视频分析失败：{e}"
     else:
@@ -35,10 +35,10 @@ async def run_video_analysis_from_path(
     max_size_mb: int,
     client: GeminiClient,
 ) -> str:
-    """从本地文件路径执行视频分析。"""
+    """从本地文件路径执行视频分析（自动选择内嵌/Files API 传输）。"""
     try:
         video = await load_video_from_path(file_path, max_size_mb)
-        result = await client.analyze(video.b64, video.mime_type)
+        result = await client.analyze_video(video)
     except (VideoError, GeminiClientError) as e:
         return f"视频分析失败：{e}"
     else:

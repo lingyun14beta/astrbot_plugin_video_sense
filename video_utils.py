@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -29,9 +28,10 @@ _MIME_MAP: dict[str, str] = {
 
 @dataclass
 class VideoFile:
-    b64: str
+    path: str
     mime_type: str
     filename: str
+    size_bytes: int
 
 
 class VideoError(Exception):
@@ -108,7 +108,7 @@ def _get_messages(event: AstrMessageEvent) -> list:
 
 
 async def load_video(file_comp, supported_formats: list[str], max_size_mb: int) -> VideoFile:
-    """校验并读取 File 组件为 VideoFile。"""
+    """校验并获取 File 组件的本地路径，返回 VideoFile（不读取内容）。"""
     name: str = getattr(file_comp, "name", "") or ""
     ext = _get_ext(name)
 
@@ -121,23 +121,23 @@ async def load_video(file_comp, supported_formats: list[str], max_size_mb: int) 
     except Exception as e:
         raise VideoError(f"获取文件失败：{e}") from e
 
-    return await _read_and_validate(local_path, ext, max_size_mb, name)
+    return await _validate(local_path, ext, max_size_mb, name)
 
 
 async def load_video_from_path(file_path: str, max_size_mb: int) -> VideoFile:
-    """从本地路径读取视频文件为 VideoFile。"""
+    """从本地路径加载视频，返回 VideoFile（不读取内容）。"""
     p = Path(file_path)
     if not p.is_file():
         raise VideoError(f"文件不存在或无法访问：{file_path}")
 
     ext = _get_ext(p.name)
-    return await _read_and_validate(str(p), ext, max_size_mb, p.name)
+    return await _validate(str(p), ext, max_size_mb, p.name)
 
 
 async def download_video_file(
     url: str,
     save_name: str,
-    timeout: int = 180,
+    timeout: int = 300,
     max_size_mb: int | None = None,
 ) -> Path:
     """下载远程视频到临时目录。
@@ -175,7 +175,7 @@ async def download_video_file(
     return dest
 
 
-async def _read_and_validate(local_path: str, ext: str, max_size_mb: int, filename: str) -> VideoFile:
+async def _validate(local_path: str, ext: str, max_size_mb: int, filename: str) -> VideoFile:
     p = Path(local_path)
     if not p.is_file():
         raise VideoError("文件不存在或无法访问，请确认文件已上传完成。")
@@ -186,12 +186,9 @@ async def _read_and_validate(local_path: str, ext: str, max_size_mb: int, filena
         size_mb = size_bytes / 1024 / 1024
         raise VideoError(f"文件大小 {size_mb:.1f} MB 超过限制 {max_size_mb} MB。")
 
-    mime_type = _MIME_MAP.get(ext, f"video/{ext}")
-
-    try:
-        raw = await asyncio.to_thread(p.read_bytes)
-    except OSError as e:
-        raise VideoError(f"读取文件失败：{e}") from e
-
-    b64 = base64.b64encode(raw).decode("ascii")
-    return VideoFile(b64=b64, mime_type=mime_type, filename=filename)
+    return VideoFile(
+        path=str(p),
+        mime_type=_MIME_MAP.get(ext, f"video/{ext}"),
+        filename=filename,
+        size_bytes=size_bytes,
+    )
