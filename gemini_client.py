@@ -291,7 +291,7 @@ class GeminiClient:
             raise GeminiClientError(f"视频压缩失败：{e}") from e
         finally:
             if compressed is not None:
-                await asyncio.to_thread(Path(compressed.path).unlink, True)
+                await asyncio.to_thread(Path(compressed.path).unlink, missing_ok=True)
 
     async def _request_text(self, url: str, headers: dict, payload: dict) -> str:
         last_error: str = "未知错误"

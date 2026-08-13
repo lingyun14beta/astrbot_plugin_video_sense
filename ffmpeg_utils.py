@@ -119,51 +119,62 @@ async def compress_video(
     dest_dir.mkdir(parents=True, exist_ok=True)
     tag = uuid.uuid4().hex[:8]
     work_path = dest_dir / f"compress_{tag}.mp4"
+    trimmed = None
+    success = False
 
-    # 1) 可选截取前 N 秒（长视频兜底）
-    if max_duration_s and max_duration_s > 0:
+    try:
+        # 1) 可选截取前 N 秒（长视频兜底）
+        if max_duration_s and max_duration_s > 0:
+            duration = await probe_duration(ffmpeg_path, str(src_path))
+            if duration is not None and duration > max_duration_s:
+                trimmed = dest_dir / f"trim_{tag}.mp4"
+                await _run_ffmpeg(
+                    ffmpeg_path,
+                    [
+                        "-i",
+                        str(src_path),
+                        "-t",
+                        str(max_duration_s),
+                        "-c",
+                        "copy",
+                        str(trimmed),
+                    ],
+                    timeout=timeout,
+                )
+                src_path = trimmed
+
+        # 2) 目标码率阶梯压缩
+        max_bytes = max_size_mb * 1024 * 1024
         duration = await probe_duration(ffmpeg_path, str(src_path))
-        if duration is not None and duration > max_duration_s:
-            trimmed = dest_dir / f"trim_{tag}.mp4"
+        attempts = 0
+        for res, quality in ((resolution, crf), (480, 32)):
+            attempts += 1
             await _run_ffmpeg(
                 ffmpeg_path,
-                [
-                    "-i",
-                    str(src_path),
-                    "-t",
-                    str(max_duration_s),
-                    "-c",
-                    "copy",
-                    str(trimmed),
-                ],
+                _build_args(
+                    str(src_path), str(work_path), res, quality, duration, max_size_mb
+                ),
                 timeout=timeout,
             )
-            src_path = trimmed
+            size = work_path.stat().st_size
+            if size <= max_bytes:
+                success = True
+                return CompressResult(
+                    path=str(work_path), size_bytes=size, attempts=attempts
+                )
 
-    # 2) 目标码率阶梯压缩
-    max_bytes = max_size_mb * 1024 * 1024
-    duration = await probe_duration(ffmpeg_path, str(src_path))
-    attempts = 0
-    for res, quality in ((resolution, crf), (480, 32)):
-        attempts += 1
-        await _run_ffmpeg(
-            ffmpeg_path,
-            _build_args(
-                str(src_path), str(work_path), res, quality, duration, max_size_mb
-            ),
-            timeout=timeout,
+        # 全部失败：清理产物后报错
+        size_mb = work_path.stat().st_size / 1024 / 1024
+        raise FfmpegError(
+            f"压缩后仍为 {size_mb:.1f} MB，超过限制 {max_size_mb} MB。"
+            "视频可能过长，请手动截取片段后重试。",
         )
-        size = work_path.stat().st_size
-        if size <= max_bytes:
-            return CompressResult(
-                path=str(work_path), size_bytes=size, attempts=attempts
-            )
-
-    size_mb = work_path.stat().st_size / 1024 / 1024
-    raise FfmpegError(
-        f"压缩后仍为 {size_mb:.1f} MB，超过限制 {max_size_mb} MB。"
-        "视频可能过长，请手动截取片段后重试。",
-    )
+    finally:
+        # 清理临时文件：截取产物总是删；压缩产物失败时删（成功由调用方负责）
+        if trimmed is not None:
+            await asyncio.to_thread(trimmed.unlink, True)
+        if not success:
+            await asyncio.to_thread(work_path.unlink, True)
 
 
 def _build_args(

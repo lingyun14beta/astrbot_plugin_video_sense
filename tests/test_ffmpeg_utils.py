@@ -172,7 +172,7 @@ class TestCompressVideo:
         assert result.attempts == 2
 
     async def test_trim_long_video_first(self, temp_dir):
-        """超过 max_duration_s → 先截取前 N 秒（-c copy）。"""
+        """超过 max_duration_s → 先截取前 N 秒（-c copy），截取文件用后即删。"""
         src = temp_dir / "src.mp4"
         src.write_bytes(b"\x00" * 1024)
         calls = []
@@ -185,13 +185,17 @@ class TestCompressVideo:
             patch("ffmpeg_utils.probe_duration", new=AsyncMock(return_value=300.0)),
             patch("ffmpeg_utils._run_ffmpeg", new=AsyncMock(side_effect=fake_run)),
         ):
-            await compress_video(
+            result = await compress_video(
                 "/usr/bin/ffmpeg", str(src), temp_dir, max_size_mb=15, max_duration_s=120
             )
         # 第一次调用是截取（-c copy -t 120）
         trim_args = calls[0]
         assert "-c" in trim_args and "copy" in trim_args
         assert "-t" in trim_args and "120" in trim_args
+        # 截取临时文件已清理，仅剩压缩产物
+        leftovers = [p.name for p in temp_dir.iterdir() if p.name.startswith("trim_")]
+        assert leftovers == []
+        assert Path(result.path).exists()
 
     async def test_still_oversize_raises(self, temp_dir):
         src = temp_dir / "src.mp4"
@@ -211,6 +215,9 @@ class TestCompressVideo:
                 await compress_video(
                     "/usr/bin/ffmpeg", str(src), temp_dir, max_size_mb=15
                 )
+        # 失败后无残留产物（compress_/trim_ 临时文件都已清理，源文件保留）
+        leftovers = [p.name for p in temp_dir.iterdir() if p.name != "src.mp4"]
+        assert leftovers == []
 
     async def test_missing_ffmpeg(self, temp_dir):
         src = temp_dir / "src.mp4"
