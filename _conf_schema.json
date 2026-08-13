@@ -1,0 +1,157 @@
+{
+  "api_provider": {
+    "description": "视频分析 API",
+    "hint": "配置用于视频理解的 Gemini API 接入方式。可添加官方接口或 OpenAI 兼容中转站。",
+    "type": "template_list",
+    "templates": {
+      "official": {
+        "name": "Gemini 官方接口",
+        "hint": "使用 Google AI Studio API Key，通过 x-goog-api-key 鉴权直连官方接口。",
+        "display_item": "name",
+        "hide_hint_in_list": true,
+        "items": {
+          "name": {
+            "description": "供应商名称",
+            "hint": "用于标识此接入方，格式：供应商名称/模型名称。",
+            "type": "string",
+            "default": "gemini-official"
+          },
+          "api_key": {
+            "description": "API Key",
+            "hint": "填写 Google AI Studio 的 API Key。",
+            "type": "string",
+            "default": ""
+          },
+          "model": {
+            "description": "模型名称",
+            "hint": "推荐 gemini-2.0-flash 或 gemini-2.5-flash。",
+            "type": "string",
+            "default": "gemini-2.0-flash"
+          },
+          "timeout": {
+            "description": "超时时间（秒）",
+            "hint": "Gemini 处理视频通常需要 60-120 秒，建议不低于 180。",
+            "type": "int",
+            "slider": { "min": 60, "max": 600, "step": 30 },
+            "default": 180
+          }
+        }
+      },
+      "openai_compat": {
+        "name": "OpenAI 兼容中转站",
+        "hint": "使用支持 Gemini generateContent 接口的中转站，通过 Bearer 鉴权。",
+        "display_item": "name",
+        "hide_hint_in_list": true,
+        "items": {
+          "name": {
+            "description": "供应商名称",
+            "hint": "用于标识此接入方，格式：供应商名称/模型名称。",
+            "type": "string",
+            "default": ""
+          },
+          "api_key": {
+            "description": "API Key / Token",
+            "hint": "填写中转站对应的访问密钥。",
+            "type": "string",
+            "default": ""
+          },
+          "base_url": {
+            "description": "Base URL",
+            "hint": "填写中转站地址，如 https://xxx.com/v1。",
+            "type": "string",
+            "default": ""
+          },
+          "model": {
+            "description": "模型名称",
+            "hint": "按中转站实际支持的模型填写，如 gemini-2.0-flash。",
+            "type": "string",
+            "default": "gemini-2.0-flash"
+          },
+          "timeout": {
+            "description": "超时时间（秒）",
+            "hint": "Gemini 处理视频通常需要 60-120 秒，建议不低于 180。",
+            "type": "int",
+            "slider": { "min": 60, "max": 600, "step": 30 },
+            "default": 180
+          }
+        }
+      }
+    }
+  },
+  "analysis": {
+    "description": "分析设置",
+    "hint": "配置视频分析行为和文件限制。",
+    "type": "object",
+    "items": {
+      "model": {
+        "description": "分析模型",
+        "hint": "格式为「供应商名称/模型名称」，如 gemini-official/gemini-2.0-flash。留空或格式错误时自动使用第一个接入方。",
+        "type": "string",
+        "default": ""
+      },
+      "system_prompt": {
+        "description": "分析系统提示词",
+        "hint": "发给 Gemini 的分析指令，告诉它如何描述视频。用于自动分析和 LLM 工具触发。",
+        "type": "text",
+        "default": "像一个朋友随便聊聊这段视频，突出你最想说的。不要列表。60字以内。"
+      },
+      "separate_prompts": {
+        "description": "指令触发使用不同提示词",
+        "hint": "开启后，「/分析视频」指令触发时使用下方独立的提示词，自动分析和 LLM 工具仍使用上方提示词。",
+        "type": "bool",
+        "default": false
+      },
+      "command_system_prompt": {
+        "description": "指令触发提示词",
+        "hint": "仅「/分析视频」指令触发时使用。",
+        "type": "text",
+        "default": "像一个朋友随便聊聊这段视频，突出你最想说的。不要列表。60字以内。",
+        "collapsed": true,
+        "condition": {
+          "separate_prompts": true
+        }
+      },
+      "enable_llm_tool": {
+        "description": "启用 LLM 工具调用",
+        "hint": "开启后 LLM 可在对话中主动调用视频分析工具，无需用户显式命令。",
+        "type": "bool",
+        "default": true
+      },
+      "auto_analyze": {
+        "description": "自动分析视频",
+        "hint": "开启后，收到视频文件时自动调用 Gemini 分析，无需等待用户指令。仅本地文件生效。⚠ 每个视频都会消耗一次 API 调用。",
+        "type": "bool",
+        "default": false
+      },
+      "inject_context": {
+        "description": "注入分析结果到对话上下文",
+        "hint": "开启后，自动分析的结果会追加到对话历史中，LLM 可直接感知无需调用工具。需同时开启「自动分析视频」。",
+        "type": "bool",
+        "default": false,
+        "collapsed": true,
+        "condition": {
+          "auto_analyze": true
+        }
+      },
+      "debug": {
+        "description": "调试模式",
+        "hint": "开启后，自动分析和缓存操作会在日志中输出详细信息，方便排查问题。",
+        "type": "bool",
+        "default": false
+      },
+      "max_file_size_mb": {
+        "description": "最大文件大小（MB）",
+        "hint": "超过此大小的视频文件将被拒绝处理。Gemini 内联传输上限为 20MB，更大的视频请先压缩或截取片段。",
+        "type": "int",
+        "slider": { "min": 1, "max": 50, "step": 1 },
+        "default": 20
+      },
+      "supported_formats": {
+        "description": "支持的视频格式",
+        "hint": "只有这些后缀名的文件会被处理（不含点号，小写）。",
+        "type": "list",
+        "default": ["mp4", "mov", "webm", "mkv", "avi", "mpeg", "mpg", "3gpp", "3g2"]
+      }
+    }
+  }
+}
