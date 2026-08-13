@@ -1,7 +1,16 @@
 name: astrbot_plugin_video_sense
-desc: 让 Bot 看懂视频，通过 Gemini 原生多模态视频理解，分析群里分享的视频文件的画面、内容与氛围，并将结果注入对话上下文。
+display_name: 视频感知
 short_desc: 让 Bot 看懂视频，并将结果注入对话上下文。
+desc: |
+  让 Bot 看懂视频，分析群里分享的视频文件的画面、内容与氛围，并将结果注入对话上下文。
+  支持指令触发（/分析视频）、LLM 工具自动触发和自动分析模式；小视频内嵌传输，大视频自动走 Files API。
 version: v0.2.0
 author: lingyun
 repo: https://github.com/lingyun14beta/astrbot_plugin_video_sense
+social_link: https://github.com/lingyun14beta
 astrbot_version: ">=4.16"
+tags:
+  - video
+  - gemini
+  - multimodal
+  - 视频
