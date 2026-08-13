@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -11,8 +11,10 @@ from video_utils import (
     _get_ext,
     _validate,
     download_video_file,
+    load_video,
     load_video_from_path,
     resolve_component_ref,
+    video_component_name,
 )
 
 
@@ -124,6 +126,73 @@ class TestLoadVideoFromPath:
     async def test_file_not_found(self):
         with pytest.raises(VideoError, match="不存在"):
             await load_video_from_path("/nonexistent.mp4", 100)
+
+
+class TestVideoComponent:
+    """Video 组件（QQ/Telegram 等平台视频消息段）支持。"""
+
+    @staticmethod
+    def _make_video(**fields):
+        """动态构造 __name__ == "Video" 的组件替身（代码按组件名判断类型）。"""
+        defaults = {"file": "", "url": "", "path": "", "name": ""}
+        defaults.update(fields)
+        return type("Video", (), defaults)()
+
+    def test_resolve_video_with_url_only(self):
+        comp = self._make_video(
+            file="562322f7f448ca042fa7e6144f04d584.mp4",
+            url="https://multimedia.nt.qq.com.cn/download?rkey=abc",
+        )
+        local, url = resolve_component_ref(comp)
+        assert url == "https://multimedia.nt.qq.com.cn/download?rkey=abc"
+        assert "562322f7f448ca042fa7e6144f04d584.mp4" in local  # 文件名兜底为本地引用
+
+    def test_resolve_video_with_path(self, temp_dir):
+        p = temp_dir / "clip.mp4"
+        p.write_bytes(b"\x00" * 10)
+        comp = self._make_video(file=str(p), path=str(p))
+        local, url = resolve_component_ref(comp)
+        assert local == str(p)
+        assert url == ""
+
+    def test_resolve_video_file_uri(self):
+        comp = self._make_video(file="file:///C:/Users/test/clip.mp4")
+        local, url = resolve_component_ref(comp)
+        assert local == "C:/Users/test/clip.mp4"
+
+    def test_video_name_from_url(self):
+        comp = self._make_video(
+            file="562322f7.mp4", url="https://example.com/clip.mp4?sign=1"
+        )
+        assert video_component_name(comp) == "562322f7.mp4"
+
+    def test_video_name_query_string_stripped(self):
+        comp = self._make_video(url="https://example.com/movie.mp4?rkey=abc123")
+        assert video_component_name(comp) == "movie.mp4"
+
+    def test_video_name_fallback(self):
+        assert video_component_name(self._make_video()) == "video.mp4"
+
+    async def test_load_video_video_component(self, temp_dir):
+        """Video 组件走 convert_to_file_path。"""
+        p = temp_dir / "clip.mp4"
+        p.write_bytes(b"\x00" * 1024)
+        comp = self._make_video()
+        comp.convert_to_file_path = AsyncMock(return_value=str(p))
+
+        result = await load_video(comp, ["mp4"], 100)
+        assert result.path == str(p)
+        assert result.filename == "video.mp4"  # 无名称时兜底
+
+    async def test_load_video_video_component_no_ext(self, temp_dir):
+        """Video 组件无扩展名时按 mp4 处理。"""
+        p = temp_dir / "clip"
+        p.write_bytes(b"\x00" * 1024)
+        comp = self._make_video()
+        comp.convert_to_file_path = AsyncMock(return_value=str(p))
+
+        result = await load_video(comp, ["mp4"], 100)
+        assert result.mime_type == "video/mp4"
 
 
 class TestDownloadVideoFile:

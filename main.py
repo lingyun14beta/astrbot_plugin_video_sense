@@ -29,6 +29,7 @@ from .video_utils import (
     extract_file_component,
     load_video,
     resolve_component_ref,
+    video_component_name,
 )
 
 _DEFAULT_SYSTEM_PROMPT = (
@@ -43,15 +44,15 @@ def _is_error(text: str) -> bool:
 
 
 class _FileComponentFilter(CustomFilter):
-    """匹配含有 File 组件的消息（含引用消息），用于缓存视频元数据。"""
+    """匹配含有 File/Video 组件的消息（含引用消息），用于缓存视频元数据。"""
 
     def filter(self, event: AstrMessageEvent, cfg: AstrBotConfig) -> bool:
         for comp in getattr(event.message_obj, "message", []):
-            if type(comp).__name__ == "File":
+            if type(comp).__name__ in ("File", "Video"):
                 return True
             if type(comp).__name__ == "Reply":
                 for rc in getattr(comp, "chain", []) or []:
-                    if type(rc).__name__ == "File":
+                    if type(rc).__name__ in ("File", "Video"):
                         return True
         return False
 
@@ -207,8 +208,10 @@ class VideoSensePlugin(Star):
         umo = event.unified_msg_origin
 
         def _cache(comp, items):
-            name = getattr(comp, "name", "") or ""
+            name = video_component_name(comp)
             ext = Path(name).suffix.lstrip(".").lower()
+            if not ext and type(comp).__name__ == "Video":
+                ext = "mp4"
             if ext not in self._supported_formats:
                 if self._debug:
                     logger.info(
@@ -235,11 +238,11 @@ class VideoSensePlugin(Star):
         async with self._lock:
             items = self._registry.setdefault(umo, [])
             for comp in getattr(event.message_obj, "message", []):
-                if type(comp).__name__ == "File":
+                if type(comp).__name__ in ("File", "Video"):
                     _cache(comp, items)
                 elif type(comp).__name__ == "Reply":
                     for rc in getattr(comp, "chain", []) or []:
-                        if type(rc).__name__ == "File":
+                        if type(rc).__name__ in ("File", "Video"):
                             _cache(rc, items)
 
         # 缓存上限裁剪：保留最近的 N 个，避免长会话无限膨胀

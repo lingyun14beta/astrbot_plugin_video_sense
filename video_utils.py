@@ -43,7 +43,10 @@ def _get_ext(name: str) -> str:
 
 
 def resolve_component_ref(comp) -> tuple[str, str]:
-    """从 File 组件提取 (local_path, remote_url)。local_path 为空时返回空字符串。"""
+    """从 File/Video 组件提取 (local_path, remote_url)。local_path 为空时返回空字符串。"""
+    if type(comp).__name__ == "Video":
+        return _resolve_video_component_ref(comp)
+
     local = ""
     url = ""
 
@@ -70,8 +73,56 @@ def resolve_component_ref(comp) -> tuple[str, str]:
     return local, url
 
 
+def _resolve_video_component_ref(comp) -> tuple[str, str]:
+    """Video 组件：字段为 file（路径/文件名/URL）、url、path。"""
+    local = ""
+    url = ""
+
+    path = getattr(comp, "path", "") or ""
+    file_ = getattr(comp, "file", "") or ""
+    raw_url = getattr(comp, "url", "") or ""
+
+    if path:
+        local = path
+    elif file_:
+        if file_.startswith(("http://", "https://")):
+            url = file_
+        elif file_.startswith(("file://", "file:")):
+            from urllib.parse import unquote, urlparse
+
+            parsed = urlparse(file_)
+            local = unquote(parsed.path)
+            if local and local[0] == "/" and len(local) > 2 and local[2] == ":":
+                local = local[1:]
+        elif not file_.startswith(("base64://", "data:")):
+            local = file_  # 本地路径或纯文件名（如 aiocqhttp 的 file 字段）
+
+    if raw_url:
+        url = raw_url
+
+    return local, url
+
+
+def video_component_name(comp) -> str:
+    """从 File/Video 组件推断文件名；Video 组件无 name 字段，从路径/URL 提取。"""
+    name = getattr(comp, "name", "") or ""
+    if name:
+        return name
+    for cand in (
+        getattr(comp, "path", "") or "",
+        getattr(comp, "file", "") or "",
+        getattr(comp, "url", "") or "",
+    ):
+        if not cand or cand.startswith(("base64://", "data:")):
+            continue
+        cand_name = Path(cand.split("?")[0]).name
+        if cand_name and "." in cand_name:
+            return cand_name
+    return "video.mp4"
+
+
 def extract_file_component(event: AstrMessageEvent):
-    """从消息链（含引用消息）中提取第一个 File 组件。"""
+    """从消息链（含引用消息）中提取第一个 File/Video 组件。"""
     messages = _get_messages(event)
 
     file_comp = _find_file_in_chain(messages)
@@ -90,7 +141,7 @@ def extract_file_component(event: AstrMessageEvent):
 
 def _find_file_in_chain(chain) -> object | None:
     for comp in chain or []:
-        if type(comp).__name__ == "File":
+        if type(comp).__name__ in ("File", "Video"):
             return comp
     return None
 
@@ -111,16 +162,24 @@ def _get_messages(event: AstrMessageEvent) -> list:
 async def load_video(
     file_comp, supported_formats: list[str], max_size_mb: int
 ) -> VideoFile:
-    """校验并获取 File 组件的本地路径，返回 VideoFile（不读取内容）。"""
-    name: str = getattr(file_comp, "name", "") or ""
+    """校验并获取 File/Video 组件的本地路径，返回 VideoFile（不读取内容）。
+
+    Video 组件通过 convert_to_file_path() 统一解析（远程 URL 自动下载）。
+    """
+    name = video_component_name(file_comp)
     ext = _get_ext(name)
+    if not ext and type(file_comp).__name__ == "Video":
+        ext = "mp4"  # Video 组件无扩展名时按 mp4 处理（框架默认后缀）
 
     if ext not in supported_formats:
         supported_str = "、".join(supported_formats)
         raise VideoError(f"文件格式 .{ext} 不支持，当前支持的格式：{supported_str}。")
 
     try:
-        local_path: str = await file_comp.get_file()
+        if type(file_comp).__name__ == "Video":
+            local_path: str = await file_comp.convert_to_file_path()
+        else:
+            local_path = await file_comp.get_file()
     except Exception as e:
         raise VideoError(f"获取文件失败：{e}") from e
 
