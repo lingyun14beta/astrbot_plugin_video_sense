@@ -168,7 +168,7 @@ class TestDownloadVideoFile:
         """文件名净化：路径分隔符与非法字符必须被剥离/替换（平台无关）。"""
         payload = sample_video_path.read_bytes()
 
-        # 正斜杠路径：Path.name 在任意平台都剥离目录部分
+        # 正斜杠路径：Path.name 在任意平台都剥离目录部分，仅净化非法字符
         with patch(
             "video_utils.aiohttp.ClientSession",
             return_value=self._mock_session(payload),
@@ -176,7 +176,7 @@ class TestDownloadVideoFile:
             dest = await download_video_file(
                 "https://example.com/clip.mp4", "../evil/name?.mp4"
             )
-        assert dest.name == "evil_name_.mp4"
+        assert dest.name == "name_.mp4"
 
         # 反斜杠路径（Windows 风格）：在 Linux 上反斜杠不是分隔符，
         # 但净化逻辑必须保证不含路径分隔符（无路径穿越风险）
