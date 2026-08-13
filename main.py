@@ -65,7 +65,25 @@ class VideoSensePlugin(Star):
         self._pending_injections: dict[str, list[dict]] = {}
         self._lock = asyncio.Lock()
         self._auto_sem = asyncio.Semaphore(2)  # 最多 2 个并发自动分析（视频请求更重）
+        self._log_ffmpeg_status()
         logger.info("[VideoSense] 插件已加载，支持格式：%s", self._supported_formats)
+
+    def _log_ffmpeg_status(self) -> None:
+        """启动时探测 ffmpeg 并在平台日志输出状态与安装建议。"""
+        from .ffmpeg_utils import find_ffmpeg
+
+        ffmpeg_path = find_ffmpeg()
+        if ffmpeg_path:
+            logger.info("[VideoSense] 已检测到 ffmpeg：%s，压缩功能可用", ffmpeg_path)
+            return
+        logger.warning(
+            "[VideoSense] 未检测到 ffmpeg，中转站/大视频自动压缩功能不可用。"
+            "如需启用，两种方式任选：\n"
+            "  ① 在 WebUI「平台日志」页面点击「安装 pip 库」，输入 imageio-ffmpeg 并安装"
+            "（⚠ 依赖较大，约 80MB，内含 ffmpeg 二进制）；\n"
+            "  ② 系统安装 ffmpeg（如 winget install ffmpeg / apt install ffmpeg）。\n"
+            "安装完成后重启 AstrBot 生效。"
+        )
 
     # ------------------------------------------------------------------
     # 配置快捷属性
@@ -97,6 +115,22 @@ class VideoSensePlugin(Star):
     @property
     def _max_cached_files(self) -> int:
         return max(1, int(self._analysis_cfg.get("max_cached_files", 50)))
+
+    @property
+    def _auto_compress(self) -> bool:
+        return bool(self._analysis_cfg.get("auto_compress", False))
+
+    @property
+    def _compress_max_duration(self) -> int:
+        return max(0, int(self._analysis_cfg.get("compress_max_duration", 120)))
+
+    @property
+    def _compress_resolution(self) -> int:
+        return max(0, int(self._analysis_cfg.get("compress_resolution", 720)))
+
+    @property
+    def _compress_crf(self) -> int:
+        return max(0, int(self._analysis_cfg.get("compress_crf", 28)))
 
     @property
     def _system_prompt(self) -> str:
@@ -168,6 +202,10 @@ class VideoSensePlugin(Star):
             max_inline_size_mb=self._max_inline_mb,
             use_files_api=self._use_files_api,
             protocol=str(provider.get("protocol", "auto") or "auto"),
+            compress=self._auto_compress,
+            compress_max_duration=self._compress_max_duration,
+            compress_resolution=self._compress_resolution,
+            compress_crf=self._compress_crf,
         )
 
     # ------------------------------------------------------------------

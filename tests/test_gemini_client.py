@@ -533,7 +533,7 @@ class TestAnalyzeVideo:
         client.upload_file.assert_not_awaited()
 
     async def test_openai_model_large_video_rejected(self, tmp_path):
-        """qwen 等 OpenAI 协议模型 + 大视频：提示压缩，不走 Files API。"""
+        """qwen 等 OpenAI 协议模型 + 大视频（未开压缩）：提示开启自动压缩。"""
         client = GeminiClient(
             api_key="k",
             model="qwen-vl-max",
@@ -543,8 +543,64 @@ class TestAnalyzeVideo:
             use_files_api=True,
         )
         video = self._make_video(2 * 1024 * 1024, tmp_path)
-        with pytest.raises(GeminiClientError, match="压缩或截取"):
+        with pytest.raises(GeminiClientError, match="自动压缩"):
             await client.analyze_video(video)
+
+    async def test_openai_model_large_video_compressed(self, tmp_path):
+        """qwen 模型 + 大视频 + 开启压缩：ffmpeg 压缩后走 OpenAI 协议分析。"""
+        from gemini_client import _MB
+
+        client = GeminiClient(
+            api_key="k",
+            model="qwen-vl-max",
+            system_prompt="s",
+            base_url="https://proxy.example.com/v1",
+            max_inline_size_mb=1,
+            use_files_api=True,
+            compress=True,
+        )
+        video = self._make_video(2 * 1024 * 1024, tmp_path)
+
+        # 压缩产物：模拟 ffmpeg 输出的小文件
+        compressed_path = tmp_path / "compressed.mp4"
+        compressed_path.write_bytes(b"\x00" * 512)
+
+        from ffmpeg_utils import CompressResult
+
+        with (
+            patch("gemini_client.find_ffmpeg", return_value="/usr/bin/ffmpeg"),
+            patch(
+                "gemini_client.compress_video",
+                new=AsyncMock(
+                    return_value=CompressResult(
+                        path=str(compressed_path), size_bytes=512, attempts=1
+                    )
+                ),
+            ),
+        ):
+            client.analyze = AsyncMock(return_value="压缩后分析结果")
+            result = await client.analyze_video(video)
+
+        assert result == "压缩后分析结果"
+        client.analyze.assert_awaited_once()
+        # 压缩产物已被清理
+        assert not compressed_path.exists()
+
+    async def test_openai_model_large_video_no_ffmpeg(self, tmp_path):
+        """开启压缩但未检测到 ffmpeg：提示通过平台日志安装 pip 库。"""
+        client = GeminiClient(
+            api_key="k",
+            model="qwen-vl-max",
+            system_prompt="s",
+            base_url="https://proxy.example.com/v1",
+            max_inline_size_mb=1,
+            use_files_api=True,
+            compress=True,
+        )
+        video = self._make_video(2 * 1024 * 1024, tmp_path)
+        with patch("gemini_client.find_ffmpeg", return_value=None):
+            with pytest.raises(GeminiClientError, match="安装 pip 库"):
+                await client.analyze_video(video)
 
     async def test_openai_model_inline_uses_openai_payload(self, tmp_path):
         """qwen 模型小视频：使用 OpenAI 协议请求（chat/completions + video_url）。"""

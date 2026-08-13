@@ -21,6 +21,11 @@ from urllib.parse import urlparse
 
 import aiohttp
 
+try:
+    from .ffmpeg_utils import FfmpegError, compress_video, find_ffmpeg
+except ImportError:  # 非包上下文（测试直接导入模块）
+    from ffmpeg_utils import FfmpegError, compress_video, find_ffmpeg
+
 _OFFICIAL_HOSTS: frozenset[str] = frozenset(
     {
         "generativelanguage.googleapis.com",
@@ -66,6 +71,10 @@ class GeminiClient:
         max_inline_size_mb: int = 15,
         use_files_api: bool = True,
         protocol: str = _PROTOCOL_AUTO,
+        compress: bool = False,
+        compress_max_duration: int = 120,
+        compress_resolution: int = 720,
+        compress_crf: int = 28,
     ) -> None:
         self._api_key = api_key.strip()
         self._model = self._normalize_model(model)
@@ -76,6 +85,10 @@ class GeminiClient:
         self._max_inline_size_mb = max(0, int(max_inline_size_mb))
         self._use_files_api = bool(use_files_api)
         self._protocol = (protocol or _PROTOCOL_AUTO).strip().lower()
+        self._compress = bool(compress)
+        self._compress_max_duration = max(0, int(compress_max_duration))
+        self._compress_resolution = max(0, int(compress_resolution))
+        self._compress_crf = max(0, int(compress_crf))
         self._session: aiohttp.ClientSession | None = None
 
     # ------------------------------------------------------------------
@@ -97,30 +110,27 @@ class GeminiClient:
                 await self._read_base64(video.path),
                 video.mime_type,
             )
-        if not self._is_gemini_protocol():
-            size_mb = video.size_bytes / _MB
-            raise GeminiClientError(
-                f"文件 {size_mb:.1f} MB 超过内嵌上限 {self._max_inline_size_mb} MB，"
-                "OpenAI 兼容协议不支持 Files API 大文件上传，"
-                "请压缩或截取视频片段后重试。",
-            )
-        if self._use_files_api:
-            if not self._is_official():
-                size_mb = video.size_bytes / _MB
-                raise GeminiClientError(
-                    f"文件 {size_mb:.1f} MB 超过内嵌上限 {self._max_inline_size_mb} MB，"
-                    "但当前接入方不支持 Files API（Files API 仅 Gemini 官方接口提供）。"
-                    "请在配置中关闭「启用 Files API」，"
-                    "或将视频压缩/截取到内嵌上限以内。",
-                )
+        # 大文件：Files API（仅 Gemini 官方）→ 压缩（可选）→ 报错
+        can_files_api = (
+            self._is_gemini_protocol() and self._use_files_api and self._is_official()
+        )
+        if can_files_api:
             file_uri = await self.upload_file(
                 video.path, video.mime_type, video.filename
             )
             return await self.analyze_file(file_uri, video.mime_type)
+        if self._compress:
+            return await self._analyze_compressed(video)
         size_mb = video.size_bytes / _MB
+        reason = (
+            "Files API 仅 Gemini 官方接口提供"
+            if self._is_gemini_protocol()
+            else "OpenAI 兼容协议不支持 Files API 大文件上传"
+        )
         raise GeminiClientError(
             f"文件 {size_mb:.1f} MB 超过内嵌上限 {self._max_inline_size_mb} MB，"
-            "且未启用 Files API，请压缩视频或在配置中开启 Files API。",
+            f"{reason}。请在配置中开启「自动压缩」（需 ffmpeg），"
+            "或手动压缩/截取视频片段后重试。",
         )
 
     async def analyze(self, video_b64: str, mime_type: str) -> str:
@@ -251,6 +261,37 @@ class GeminiClient:
     async def _read_base64(self, file_path: str) -> str:
         raw = await asyncio.to_thread(Path(file_path).read_bytes)
         return base64.b64encode(raw).decode("ascii")
+
+    async def _analyze_compressed(self, video) -> str:
+        """大视频走 ffmpeg 压缩后内嵌分析（中转站/OpenAI 协议场景）。"""
+        ffmpeg_path = find_ffmpeg()
+        if not ffmpeg_path:
+            raise GeminiClientError(
+                "未检测到 ffmpeg，无法自动压缩。请在「平台日志」页面点击"
+                "「安装 pip 库」安装 imageio-ffmpeg（依赖较大，约 80MB），"
+                "或在系统安装 ffmpeg，然后重启 AstrBot。",
+            )
+        import tempfile
+
+        dest_dir = Path(tempfile.gettempdir()) / "astrbot_video_sense" / "compress"
+        compressed = None
+        try:
+            compressed = await compress_video(
+                ffmpeg_path,
+                video.path,
+                dest_dir,
+                self._max_inline_size_mb,
+                max_duration_s=self._compress_max_duration,
+                resolution=self._compress_resolution,
+                crf=self._compress_crf,
+            )
+            b64 = await self._read_base64(compressed.path)
+            return await self.analyze(b64, video.mime_type)
+        except FfmpegError as e:
+            raise GeminiClientError(f"视频压缩失败：{e}") from e
+        finally:
+            if compressed is not None:
+                await asyncio.to_thread(Path(compressed.path).unlink, True)
 
     async def _request_text(self, url: str, headers: dict, payload: dict) -> str:
         last_error: str = "未知错误"

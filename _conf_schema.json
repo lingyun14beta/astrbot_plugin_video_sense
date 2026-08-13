@@ -176,6 +176,46 @@
         "default": 50,
         "collapsed": true
       },
+      "auto_compress": {
+        "description": "自动压缩超限视频",
+        "hint": "中转站/OpenAI 兼容协议且视频超过内嵌上限时，用 ffmpeg 压缩后再分析。需 ffmpeg（系统安装或平台日志页安装 imageio-ffmpeg，依赖较大约 80MB）；未检测到 ffmpeg 时自动跳过并提示。",
+        "type": "bool",
+        "default": false,
+        "collapsed": true
+      },
+      "compress_max_duration": {
+        "description": "压缩前截取时长上限（秒）",
+        "hint": "超过此时长的视频先无损截取前 N 秒再压缩，防止长视频压不进内嵌上限。",
+        "type": "int",
+        "slider": { "min": 15, "max": 600, "step": 15 },
+        "default": 120,
+        "collapsed": true,
+        "condition": {
+          "auto_compress": true
+        }
+      },
+      "compress_resolution": {
+        "description": "压缩分辨率（高度）",
+        "hint": "视频高度压缩到该值（如 720/480），宽度等比缩放。",
+        "type": "int",
+        "slider": { "min": 240, "max": 1080, "step": 120 },
+        "default": 720,
+        "collapsed": true,
+        "condition": {
+          "auto_compress": true
+        }
+      },
+      "compress_crf": {
+        "description": "压缩质量（CRF）",
+        "hint": "H.264 质量参数，18-32 之间，越大画质越低体积越小。",
+        "type": "int",
+        "slider": { "min": 18, "max": 32, "step": 1 },
+        "default": 28,
+        "collapsed": true,
+        "condition": {
+          "auto_compress": true
+        }
+      },
       "supported_formats": {
         "description": "支持的视频格式",
         "hint": "只有这些后缀名的文件会被处理（不含点号，小写）。",
