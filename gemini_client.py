@@ -89,6 +89,14 @@ class GeminiClient:
                 video.mime_type,
             )
         if self._use_files_api:
+            if not self._is_official():
+                size_mb = video.size_bytes / _MB
+                raise GeminiClientError(
+                    f"文件 {size_mb:.1f} MB 超过内嵌上限 {self._max_inline_size_mb} MB，"
+                    "但当前接入方不支持 Files API（Files API 仅 Gemini 官方接口提供）。"
+                    "请在配置中关闭「启用 Files API」，"
+                    "或将视频压缩/截取到内嵌上限以内。",
+                )
             file_uri = await self.upload_file(
                 video.path, video.mime_type, video.filename
             )
@@ -132,6 +140,11 @@ class GeminiClient:
             GeminiClientError: 上传或处理失败。
         """
         self._require_api_key()
+        if not self._is_official():
+            raise GeminiClientError(
+                "Files API 仅 Gemini 官方接口提供，当前接入方（中转站）不支持，"
+                "请使用官方接口或在配置中关闭「启用 Files API」。",
+            )
 
         p = Path(file_path)
         if not p.is_file():

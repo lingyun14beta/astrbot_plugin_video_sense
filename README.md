@@ -108,7 +108,7 @@ mp4、mov、webm、avi、mpeg、mpg、flv、wmv、3gpp（官方支持的视频�
 | 注入分析结果到对话上下文 | 自动分析的结果追加到对话上下文（需开启自动分析） | 关闭 |
 | 调试模式 | 输出详细日志，方便排查 | 关闭 |
 
-> **Files API 说明**：视频超过「内嵌传输上限」时，插件通过官方 [Files API](https://ai.google.dev/gemini-api/docs/files)（resumable 上传协议）上传后引用分析。免费层单文件上限 2GB。OpenAI 兼容中转站通常不支持 Files API，请关闭「启用 Files API」并将「内嵌传输上限」调高或压缩视频。
+> **Files API 说明**：视频超过「内嵌传输上限」时，插件通过官方 [Files API](https://ai.google.dev/gemini-api/docs/files)（resumable 上传协议）上传后引用分析。免费层单文件上限 2GB。**Files API 仅 Gemini 官方接口提供**：OpenAI 兼容中转站接入时，超过内嵌上限的视频会直接报错并提示（不会发起注定失败的上传），请关闭「启用 Files API」或将视频压缩/截取到内嵌上限以内。
 
 ## 开发
 

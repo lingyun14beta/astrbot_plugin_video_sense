@@ -356,6 +356,22 @@ class TestAnalyzeVideo:
         with pytest.raises(GeminiClientError, match="超过内嵌上限"):
             await client.analyze_video(video)
 
+    async def test_files_api_rejected_on_proxy_base(self, tmp_path):
+        """中转站接入方 + 大视频：不发起上传，直接给出明确错误。"""
+        client = GeminiClient(
+            api_key="k",
+            model="m",
+            system_prompt="s",
+            base_url="https://proxy.example.com/v1",
+            max_inline_size_mb=1,
+            use_files_api=True,
+        )
+        video = self._make_video(2 * 1024 * 1024, tmp_path)
+        client.upload_file = AsyncMock()
+        with pytest.raises(GeminiClientError, match="不支持 Files API"):
+            await client.analyze_video(video)
+        client.upload_file.assert_not_awaited()
+
 
 class TestUploadFile:
     def _client(self):
@@ -485,3 +501,15 @@ class TestUploadFile:
         client = self._client()
         with pytest.raises(GeminiClientError, match="不存在"):
             await client.upload_file("/nonexistent/clip.mp4", "video/mp4", "clip.mp4")
+
+    async def test_upload_rejected_on_proxy_base(self, tmp_path):
+        client = GeminiClient(
+            api_key="k",
+            model="m",
+            system_prompt="s",
+            base_url="https://proxy.example.com/v1",
+        )
+        p = tmp_path / "clip.mp4"
+        p.write_bytes(b"\x00" * 64)
+        with pytest.raises(GeminiClientError, match="不支持"):
+            await client.upload_file(str(p), "video/mp4", "clip.mp4")
