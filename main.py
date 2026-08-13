@@ -74,7 +74,7 @@ class VideoSensePlugin(Star):
     def _supported_formats(self) -> list[str]:
         return self._analysis_cfg.get(
             "supported_formats",
-            ["mp4", "mov", "webm", "mkv", "avi", "mpeg", "mpg", "3gpp", "3g2"],
+            ["mp4", "mov", "webm", "mkv", "avi", "mpeg", "mpg", "flv", "wmv", "3gpp", "3g2"],
         )
 
     @property

@@ -150,7 +150,7 @@
         "description": "支持的视频格式",
         "hint": "只有这些后缀名的文件会被处理（不含点号，小写）。",
         "type": "list",
-        "default": ["mp4", "mov", "webm", "mkv", "avi", "mpeg", "mpg", "3gpp", "3g2"]
+        "default": ["mp4", "mov", "webm", "mkv", "avi", "mpeg", "mpg", "flv", "wmv", "3gpp", "3g2"]
       }
     }
   }

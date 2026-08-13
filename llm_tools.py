@@ -60,9 +60,9 @@ async def resolve_video_ref(
             return ref
         raise VideoError(f"文件已过期或不可访问：{ref}")
 
-    # 远程 URL，按需下载
+    # 远程 URL，按需下载（下载前按 max_size_mb 预检大小）
     name = item.get("name", "video")
-    dest = await download_video_file(ref, name)
+    dest = await download_video_file(ref, name, max_size_mb=max_size_mb)
     item["ref"] = str(dest)
     item["is_local"] = True
     return str(dest)

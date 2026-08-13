@@ -24,6 +24,7 @@ _MIME_MAP: dict[str, str] = {
     "3gpp": "video/3gpp",
     "3g2": "video/3g2",
     "flv": "video/x-flv",
+    "wmv": "video/x-ms-wmv",
 }
 
 
@@ -134,20 +135,42 @@ async def load_video_from_path(file_path: str, max_size_mb: int) -> VideoFile:
     return await _read_and_validate(str(p), ext, max_size_mb, p.name)
 
 
-async def download_video_file(url: str, save_name: str, timeout: int = 180) -> Path:
-    """下载远程视频到临时目录。"""
+async def download_video_file(
+    url: str,
+    save_name: str,
+    timeout: int = 180,
+    max_size_mb: int | None = None,
+) -> Path:
+    """下载远程视频到临时目录。
+
+    可选传入 max_size_mb：下载前通过 Content-Length 预检，超出直接拒绝。
+    """
+    import re
     import tempfile
 
     tmp_dir = Path(tempfile.gettempdir()) / "astrbot_video_sense"
     tmp_dir.mkdir(parents=True, exist_ok=True)
-    dest = tmp_dir / save_name
+    # 消息文件名可能含路径分隔符或非法字符，仅取 basename 并清理
+    safe_name = Path(save_name or "video").name
+    safe_name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", safe_name).strip()
+    dest = tmp_dir / (safe_name or "video")
+
+    max_bytes = max_size_mb * 1024 * 1024 if max_size_mb else None
 
     timeout_obj = aiohttp.ClientTimeout(total=timeout)
     async with aiohttp.ClientSession(timeout=timeout_obj, trust_env=False) as session:
         async with session.get(url) as resp:
             if resp.status != 200:
                 raise VideoError(f"下载视频失败：HTTP {resp.status}")
+            if max_bytes is not None:
+                content_length = resp.headers.get("Content-Length")
+                if content_length and int(content_length) > max_bytes:
+                    raise VideoError(f"文件大小超过限制 {max_size_mb} MB。")
             data = await resp.read()
+
+    if max_bytes is not None and len(data) > max_bytes:
+        size_mb = len(data) / 1024 / 1024
+        raise VideoError(f"文件大小 {size_mb:.1f} MB 超过限制 {max_size_mb} MB。")
 
     await asyncio.to_thread(dest.write_bytes, data)
     return dest

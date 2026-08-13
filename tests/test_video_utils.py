@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -128,3 +129,92 @@ class TestLoadVideoFromPath:
     async def test_file_not_found(self):
         with pytest.raises(VideoError, match="不存在"):
             await load_video_from_path("/nonexistent.mp4", 20)
+
+
+class TestDownloadVideoFile:
+    def _mock_session(self, payload: bytes, content_length: str | None = None):
+        class MockResp:
+            status = 200
+            headers = {"Content-Length": content_length} if content_length else {}
+
+            async def read(self):
+                return payload
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                pass
+
+        class MockSession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                pass
+
+            def get(self, url):
+                return MockResp()
+
+        return MockSession()
+
+    async def test_download_success(self, temp_dir, sample_video_path):
+        payload = sample_video_path.read_bytes()
+        with patch("video_utils.aiohttp.ClientSession", return_value=self._mock_session(payload)):
+            dest = await download_video_file("https://example.com/clip.mp4", "clip.mp4")
+        assert dest.is_file()
+        assert dest.read_bytes() == payload
+        assert dest.name == "clip.mp4"
+
+    async def test_sanitizes_unsafe_filename(self, sample_video_path):
+        payload = sample_video_path.read_bytes()
+        with patch("video_utils.aiohttp.ClientSession", return_value=self._mock_session(payload)):
+            dest = await download_video_file(
+                "https://example.com/clip.mp4", r"..\..\evil:name?.mp4"
+            )
+        assert dest.name == "evil_name_.mp4"
+
+    async def test_content_length_too_large(self, sample_video_path):
+        payload = sample_video_path.read_bytes()
+        mock = self._mock_session(payload, content_length=str(50 * 1024 * 1024))
+        with patch("video_utils.aiohttp.ClientSession", return_value=mock):
+            with pytest.raises(VideoError, match="超过限制"):
+                await download_video_file(
+                    "https://example.com/big.mp4", "big.mp4", max_size_mb=20
+                )
+
+    async def test_actual_size_too_large(self, sample_large_video_path):
+        payload = sample_large_video_path.read_bytes()
+        with patch("video_utils.aiohttp.ClientSession", return_value=self._mock_session(payload)):
+            with pytest.raises(VideoError, match="超过限制"):
+                await download_video_file(
+                    "https://example.com/big.mp4", "big.mp4", max_size_mb=1
+                )
+
+    async def test_http_error(self):
+        class MockResp:
+            status = 404
+            headers = {}
+
+            async def read(self):
+                return b""
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                pass
+
+        class MockSession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                pass
+
+            def get(self, url):
+                return MockResp()
+
+        with patch("video_utils.aiohttp.ClientSession", return_value=MockSession()):
+            with pytest.raises(VideoError, match="HTTP 404"):
+                await download_video_file("https://example.com/missing.mp4", "missing.mp4")

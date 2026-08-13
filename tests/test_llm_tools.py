@@ -74,6 +74,8 @@ class TestResolveVideoRef:
 
         class MockResp:
             status = 200
+            headers = {}
+
             async def read(self):
                 return sample_video_path.read_bytes()
             async def __aenter__(self):
