@@ -141,16 +141,16 @@
       },
       "max_file_size_mb": {
         "description": "最大文件大小（MB）",
-        "hint": "超过此大小的视频文件将被拒绝处理。Gemini 内联传输上限为 20MB，更大的视频请先压缩或截取片段。",
+        "hint": "超过此大小的视频文件将被拒绝处理。Gemini 内嵌传输的总请求体上限为 20MB，base64 编码会膨胀约 33%，故默认 15MB 较稳妥；更大的视频请压缩或改用 Files API 方案。",
         "type": "int",
         "slider": { "min": 1, "max": 50, "step": 1 },
-        "default": 20
+        "default": 15
       },
       "supported_formats": {
         "description": "支持的视频格式",
         "hint": "只有这些后缀名的文件会被处理（不含点号，小写）。",
         "type": "list",
-        "default": ["mp4", "mov", "webm", "mkv", "avi", "mpeg", "mpg", "flv", "wmv", "3gpp", "3g2"]
+        "default": ["mp4", "mov", "webm", "avi", "mpeg", "mpg", "flv", "wmv", "3gpp"]
       }
     }
   }

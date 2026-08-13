@@ -13,18 +13,17 @@ import aiohttp
 if TYPE_CHECKING:
     from astrbot.api.event import AstrMessageEvent
 
+# MIME 类型与官方文档对齐：https://ai.google.dev/gemini-api/docs/video-understanding
 _MIME_MAP: dict[str, str] = {
     "mp4": "video/mp4",
-    "mov": "video/quicktime",
+    "mov": "video/mov",
     "webm": "video/webm",
-    "mkv": "video/x-matroska",
-    "avi": "video/x-msvideo",
+    "avi": "video/avi",
     "mpeg": "video/mpeg",
     "mpg": "video/mpeg",
-    "3gpp": "video/3gpp",
-    "3g2": "video/3g2",
     "flv": "video/x-flv",
-    "wmv": "video/x-ms-wmv",
+    "wmv": "video/wmv",
+    "3gpp": "video/3gpp",
 }
 
 

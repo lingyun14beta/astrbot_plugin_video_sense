@@ -74,12 +74,12 @@ class VideoSensePlugin(Star):
     def _supported_formats(self) -> list[str]:
         return self._analysis_cfg.get(
             "supported_formats",
-            ["mp4", "mov", "webm", "mkv", "avi", "mpeg", "mpg", "flv", "wmv", "3gpp", "3g2"],
+            ["mp4", "mov", "webm", "avi", "mpeg", "mpg", "flv", "wmv", "3gpp"],
         )
 
     @property
     def _max_size_mb(self) -> int:
-        return int(self._analysis_cfg.get("max_file_size_mb", 20))
+        return int(self._analysis_cfg.get("max_file_size_mb", 15))
 
     @property
     def _system_prompt(self) -> str:

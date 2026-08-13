@@ -50,7 +50,7 @@
 
 ## 支持的视频格式
 
-mp4、mov、webm、mkv、avi、mpeg、mpg、flv、wmv、3gpp、3g2
+mp4、mov、webm、avi、mpeg、mpg、flv、wmv、3gpp（与 [Gemini 官方文档](https://ai.google.dev/gemini-api/docs/video-understanding) 对齐）
 
 ## 配置说明
 
@@ -95,8 +95,8 @@ mp4、mov、webm、mkv、avi、mpeg、mpg、flv、wmv、3gpp、3g2
 | 指令触发使用不同提示词 | 开启后可单独配置 `/分析视频` 的提示词 | 关闭 |
 | 指令触发提示词 | 仅 `/分析视频` 指令触发时使用 | 同分析系统提示词 |
 | 启用 LLM 工具调用 | 开启后 Bot 可主动分析 | 开启 |
-| 最大文件大小 | 超过直接拒绝（Gemini 内联传输上限 20MB） | 20 MB |
-| 支持的视频格式 | 仅列表内格式会被缓存 | mp4/mov/webm/mkv/avi/mpeg/mpg/flv/wmv/3gpp/3g2 |
+| 最大文件大小 | 超过直接拒绝（Gemini 内嵌请求体上限 20MB，base64 膨胀约 33%，默认 15MB 较稳妥） | 15 MB |
+| 支持的视频格式 | 仅列表内格式会被缓存 | mp4/mov/webm/avi/mpeg/mpg/flv/wmv/3gpp |
 | 自动分析视频 | 收到本地视频文件时自动分析（远程文件仍会记录，可用指令或工具手动触发下载分析） | 关闭 |
 | 注入分析结果到对话上下文 | 自动分析的结果追加到对话上下文（需开启自动分析） | 关闭 |
 | 调试模式 | 输出详细日志，方便排查 | 关闭 |

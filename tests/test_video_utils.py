@@ -102,7 +102,7 @@ class TestReadAndValidate:
         result = await _read_and_validate(
             str(sample_mov_path), "mov", 20, "clip.mov"
         )
-        assert result.mime_type == "video/quicktime"
+        assert result.mime_type == "video/mov"
 
     async def test_unsupported_extension_uses_generic_mime(self, temp_dir):
         p = temp_dir / "test.xyz"
