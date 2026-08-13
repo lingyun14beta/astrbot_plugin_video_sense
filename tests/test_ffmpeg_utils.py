@@ -59,7 +59,10 @@ class TestFindFfmpeg:
     def test_is_available(self):
         with patch("ffmpeg_utils.shutil.which", return_value="ffmpeg"):
             assert is_available() is True
-        with patch("ffmpeg_utils.shutil.which", return_value=None):
+        with (
+            patch("ffmpeg_utils.shutil.which", return_value=None),
+            patch("ffmpeg_utils._HAS_IMAGEIO_FFMPEG", False),
+        ):
             assert is_available() is False
 
 
