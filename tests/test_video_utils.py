@@ -165,15 +165,32 @@ class TestDownloadVideoFile:
         assert dest.name == "clip.mp4"
 
     async def test_sanitizes_unsafe_filename(self, sample_video_path):
+        """文件名净化：路径分隔符与非法字符必须被剥离/替换（平台无关）。"""
         payload = sample_video_path.read_bytes()
+
+        # 正斜杠路径：Path.name 在任意平台都剥离目录部分
         with patch(
             "video_utils.aiohttp.ClientSession",
             return_value=self._mock_session(payload),
         ):
             dest = await download_video_file(
-                "https://example.com/clip.mp4", r"..\..\evil:name?.mp4"
+                "https://example.com/clip.mp4", "../evil/name?.mp4"
             )
         assert dest.name == "evil_name_.mp4"
+
+        # 反斜杠路径（Windows 风格）：在 Linux 上反斜杠不是分隔符，
+        # 但净化逻辑必须保证不含路径分隔符（无路径穿越风险）
+        with patch(
+            "video_utils.aiohttp.ClientSession",
+            return_value=self._mock_session(payload),
+        ):
+            dest2 = await download_video_file(
+                "https://example.com/clip.mp4", r"..\..\evil:name?.mp4"
+            )
+        assert "/" not in dest2.name
+        assert "\\" not in dest2.name
+        assert ":" not in dest2.name
+        assert dest2.name.endswith(".mp4")
 
     async def test_content_length_too_large(self, sample_video_path):
         payload = sample_video_path.read_bytes()
