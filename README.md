@@ -11,7 +11,8 @@
 - 指令触发可使用独立的分析提示词
 - 本地文件直接读取，远程文件按需下载
 - 分析结果缓存，重复分析不消耗 API
-- **双传输模式**：小视频（默认 ≤15MB）内嵌传输；大视频自动走官方 Files API（免费层 2GB），突破 20MB 请求体限制
+- **双协议支持**：gemini 模型走 Gemini 协议；qwen-vl、gpt 等模型自动走 OpenAI 兼容协议
+- **双传输模式**：小视频（默认 ≤15MB）内嵌传输；大视频自动走官方 Files API（免费层 2GB）或 ffmpeg 自动压缩
 - 每会话缓存数量上限，防止长会话内存膨胀
 
 ## 使用方式
@@ -60,7 +61,7 @@ mp4、mov、webm、avi、mpeg、mpg、flv、wmv、3gpp（官方支持的视频�
 
 ### 添加 API 接入方
 
-插件支持多个接入方，每个接入方对应一个 Gemini API 来源。
+插件支持多个接入方，每个接入方对应一个视频理解 API 来源（Gemini 官方接口或 OpenAI 兼容中转站）。
 
 **Gemini 官方接口**
 
@@ -96,24 +97,24 @@ mp4、mov、webm、avi、mpeg、mpg、flv、wmv、3gpp（官方支持的视频�
 
 | 配置项 | 说明 | 默认值 |
 |--------|------|--------|
-| 分析系统提示词 | Gemini 分析指令，自动分析和 LLM 工具触发时使用 | 内置提示词 |
+| 分析系统提示词 | 分析指令，自动分析和 LLM 工具触发时使用 | 内置提示词 |
 | 指令触发使用不同提示词 | 开启后可单独配置 `/分析视频` 的提示词 | 关闭 |
 | 指令触发提示词 | 仅 `/分析视频` 指令触发时使用 | 同分析系统提示词 |
 | 启用 LLM 工具调用 | 开启后 Bot 可主动分析 | 开启 |
 | 最大文件大小 | 文件总大小上限，超过直接拒绝（Files API 免费层 2GB） | 100 MB |
-| 内嵌传输上限 | ≤ 此大小用内嵌传输（请求体含 base64 约膨胀 33%，官方上限 20MB），超过走 Files API | 15 MB |
-| 启用 Files API | 超过内嵌上限时通过官方 Files API 上传（仅 Gemini 官方接口；OpenAI 兼容协议不支持大文件，请压缩） | 开启 |
+| 内嵌传输上限 | ≤ 此大小用内嵌传输（请求体含 base64 约膨胀 33%，官方上限 20MB），超过走 Files API 或自动压缩 | 15 MB |
+| 启用 Files API | 超过内嵌上限时通过官方 Files API 上传（仅 Gemini 官方接口） | 开启 |
 | 每会话缓存视频数上限 | 超出自动丢弃最旧条目 | 50 |
 | 支持的视频格式 | 仅列表内格式会被缓存 | mp4/mov/webm/avi/mpeg/mpg/flv/wmv/3gpp |
 | 自动分析视频 | 收到本地视频文件时自动分析（远程文件仍会记录，可用指令或工具手动触发下载分析） | 关闭 |
 | 注入分析结果到对话上下文 | 自动分析的结果追加到对话上下文（需开启自动分析） | 关闭 |
 | 调试模式 | 输出详细日志，方便排查 | 关闭 |
 
-> **Files API 说明**：视频超过「内嵌传输上限」时，插件通过官方 [Files API](https://ai.google.dev/gemini-api/docs/files)（resumable 上传协议）上传后引用分析。免费层单文件上限 2GB。**Files API 仅 Gemini 官方接口提供**：OpenAI 兼容中转站接入时，超过内嵌上限的视频会直接报错并提示（不会发起注定失败的上传），请关闭「启用 Files API」或将视频压缩/截取到内嵌上限以内。
+> **Files API 说明**：视频超过「内嵌传输上限」时，Gemini 官方接口通过 [Files API](https://ai.google.dev/gemini-api/docs/files)（resumable 上传协议）上传后引用分析，免费层单文件上限 2GB。中转站接入时 Files API 不可用（不会发起注定失败的上传），超过内嵌上限的视频请开启「自动压缩超限视频」，或手动压缩/截取后重试。
 
 ### 自动压缩（可选）
 
-中转站/OpenAI 兼容协议接入且视频超过「内嵌传输上限」时，开启「自动压缩超限视频」后，插件会用 ffmpeg 把视频压缩到内嵌上限以内再分析（目标码率阶梯降级：720p → 480p，长视频先截取前 N 秒）。
+中转站接入（Gemini 协议或 OpenAI 兼容协议）且视频超过「内嵌传输上限」时，开启「自动压缩超限视频」后，插件会用 ffmpeg 把视频压缩到内嵌上限以内再分析（目标码率阶梯降级：720p → 480p，长视频先截取前 N 秒）。
 
 **插件不会自动安装 ffmpeg**，需要二选一：
 
@@ -132,6 +133,10 @@ mp4、mov、webm、avi、mpeg、mpg、flv、wmv、3gpp（官方支持的视频�
 ## 开发
 
 ```bash
-pip install pytest pytest-asyncio aiohttp
+pip install pytest pytest-asyncio aiohttp ruff
+ruff check .          # lint（配置见 pyproject.toml，规则与 AstrBot 官方一致）
+ruff format --check . # 格式检查
 python -m pytest tests -v
 ```
+
+> 压缩功能的真实联调需要 ffmpeg：`pip install imageio-ffmpeg`（仅测试环境安装，插件不声明该依赖）。
