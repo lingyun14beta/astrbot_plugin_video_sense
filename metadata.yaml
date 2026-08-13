@@ -4,3 +4,4 @@ short_desc: 让 Bot 看懂视频，并将结果注入对话上下文。
 version: v0.2.0
 author: lingyun
 repo: https://github.com/lingyun14beta/astrbot_plugin_video_sense
+astrbot_version: ">=4.16"
