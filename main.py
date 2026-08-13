@@ -458,6 +458,10 @@ class VideoSensePlugin(Star):
 
         if not items:
             return "未找到视频文件，请先发送视频文件。"
+        try:
+            number = int(number)
+        except (TypeError, ValueError):
+            return "序号无效，必须是整数。"
         if number < 1 or number > len(items):
             return f"序号无效，可选范围 1-{len(items)}。"
 

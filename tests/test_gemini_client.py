@@ -417,6 +417,36 @@ class TestUploadFile:
             uri = await client.upload_file(str(p), "video/mp4", "clip.mp4")
         assert uri == "uri1"
 
+    async def test_upload_poll_failed_state(self, tmp_path):
+        client = self._client()
+        p = tmp_path / "clip.mp4"
+        p.write_bytes(b"\x00" * 64)
+        session = _FakeSession(
+            post=_FakeResp(headers={"X-Goog-Upload-URL": "https://up.example.com/x"}),
+            put=_FakeResp(
+                json_data={
+                    "file": {"name": "files/1", "uri": "uri1", "state": "PROCESSING"}
+                }
+            ),
+            gets=[
+                _FakeResp(
+                    json_data={
+                        "file": {
+                            "name": "files/1",
+                            "uri": "uri1",
+                            "state": "FAILED",
+                            "error": {"message": "invalid video"},
+                        }
+                    }
+                ),
+            ],
+        )
+        with patch.object(
+            GeminiClient, "_get_session", new=AsyncMock(return_value=session)
+        ):
+            with pytest.raises(GeminiClientError, match="invalid video"):
+                await client.upload_file(str(p), "video/mp4", "clip.mp4")
+
     async def test_upload_failed_state(self, tmp_path):
         client = self._client()
         p = tmp_path / "clip.mp4"

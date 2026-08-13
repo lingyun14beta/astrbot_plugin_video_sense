@@ -232,7 +232,8 @@ class GeminiClient:
     async def _wait_file_active(self, name: str, uri: str, timeout: int = 180) -> str:
         get_url = f"{self._effective_base()}/v1beta/{name}"
         session = await self._get_session()
-        deadline = asyncio.get_event_loop().time() + timeout
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
         delay = 1.0
         while True:
             async with session.get(get_url, headers=self._build_headers()) as resp:
@@ -250,7 +251,7 @@ class GeminiClient:
                 return uri
             if state == _FILE_STATE_FAILED:
                 raise GeminiClientError(f"文件处理失败：{f.get('error')}")
-            if asyncio.get_event_loop().time() >= deadline:
+            if loop.time() >= deadline:
                 raise GeminiClientError("等待文件处理超时，请稍后重试。")
             await asyncio.sleep(delay)
             delay = min(delay * 2, 5.0)
