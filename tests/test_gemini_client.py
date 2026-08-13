@@ -211,6 +211,16 @@ class TestBuildUrlForOpenAIProtocol:
         )
         assert client._build_url() == "https://proxy.example.com/v1/chat/completions"
 
+    def test_openai_model_base_with_v1beta_openai_suffix(self):
+        """base 为 Gemini 中转端点时回退到根路径拼接。"""
+        client = GeminiClient(
+            api_key="k",
+            model="qwen-vl-max",
+            system_prompt="s",
+            base_url="https://proxy.example.com/v1beta/openai",
+        )
+        assert client._build_url() == "https://proxy.example.com/chat/completions"
+
 
 class TestBuildOpenAiPayload:
     def test_payload_structure(self, sample_video_base64):
@@ -352,6 +362,17 @@ class TestAnalyzeWithoutApiKey:
             system_prompt="test",
         )
         with pytest.raises(GeminiClientError, match="未配置 API Key"):
+            await client.analyze_file("https://example.com/v1beta/files/1", "video/mp4")
+
+    async def test_analyze_file_rejected_on_openai_protocol(self):
+        """OpenAI 协议下引用 Files API 文件应被拦截。"""
+        client = GeminiClient(
+            api_key="k",
+            model="qwen-vl-max",
+            system_prompt="s",
+            base_url="https://proxy.example.com/v1",
+        )
+        with pytest.raises(GeminiClientError, match="仅 Gemini 协议"):
             await client.analyze_file("https://example.com/v1beta/files/1", "video/mp4")
 
 

@@ -137,8 +137,12 @@ class GeminiClient:
         )
 
     async def analyze_file(self, file_uri: str, mime_type: str) -> str:
-        """Files API：通过已上传文件的 URI 分析视频。"""
+        """Files API：通过已上传文件的 URI 分析视频（仅 Gemini 协议）。"""
         self._require_api_key()
+        if not self._is_gemini_protocol():
+            raise GeminiClientError(
+                "Files API 仅 Gemini 协议支持，当前协议无法引用文件。"
+            )
         return await self._request_text(
             self._build_url(),
             self._build_headers(),
@@ -326,6 +330,8 @@ class GeminiClient:
         # OpenAI 兼容协议
         if base.endswith("/chat/completions"):
             return base  # base 已包含完整端点，原样使用
+        if base.endswith("/v1beta/openai"):
+            base = base[: -len("/v1beta/openai")]  # Gemini 中转端点 → 根路径
         return f"{base}/chat/completions"
 
     def _build_upload_url(self) -> str:
