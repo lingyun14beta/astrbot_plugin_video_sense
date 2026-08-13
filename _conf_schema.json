@@ -163,7 +163,7 @@
       },
       "use_files_api": {
         "description": "启用 Files API（大视频上传）",
-        "hint": "超过内嵌上限的视频通过官方 Files API（resumable 上传）处理，免费层单文件 2GB。仅官方接口支持；OpenAI 兼容中转站通常不支持，请关闭。",
+        "hint": "超过内嵌上限的视频通过官方 Files API（resumable 上传）处理，免费层单文件 2GB。此开关仅对 Gemini 官方接口生效；中转站接入时会自动跳过 Files API（无论开关状态），改走自动压缩或报错提示，无需手动关闭。",
         "type": "bool",
         "default": true,
         "collapsed": true
