@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -91,18 +90,14 @@ class TestResolveComponentRef:
 
 class TestValidate:
     async def test_valid_file(self, sample_video_path):
-        result = await _validate(
-            str(sample_video_path), "mp4", 100, "test.mp4"
-        )
+        result = await _validate(str(sample_video_path), "mp4", 100, "test.mp4")
         assert result.path == str(sample_video_path)
         assert result.filename == "test.mp4"
         assert result.mime_type == "video/mp4"
         assert result.size_bytes == sample_video_path.stat().st_size
 
     async def test_mov_mime(self, sample_mov_path):
-        result = await _validate(
-            str(sample_mov_path), "mov", 100, "clip.mov"
-        )
+        result = await _validate(str(sample_mov_path), "mov", 100, "clip.mov")
         assert result.mime_type == "video/mov"
 
     async def test_unsupported_extension_uses_generic_mime(self, temp_dir):
@@ -113,9 +108,7 @@ class TestValidate:
 
     async def test_file_too_large(self, sample_large_video_path):
         with pytest.raises(VideoError, match="超过限制"):
-            await _validate(
-                str(sample_large_video_path), "mp4", 1, "large.mp4"
-            )
+            await _validate(str(sample_large_video_path), "mp4", 1, "large.mp4")
 
     async def test_file_not_exists(self):
         with pytest.raises(VideoError, match="不存在"):
@@ -162,7 +155,10 @@ class TestDownloadVideoFile:
 
     async def test_download_success(self, temp_dir, sample_video_path):
         payload = sample_video_path.read_bytes()
-        with patch("video_utils.aiohttp.ClientSession", return_value=self._mock_session(payload)):
+        with patch(
+            "video_utils.aiohttp.ClientSession",
+            return_value=self._mock_session(payload),
+        ):
             dest = await download_video_file("https://example.com/clip.mp4", "clip.mp4")
         assert dest.is_file()
         assert dest.read_bytes() == payload
@@ -170,7 +166,10 @@ class TestDownloadVideoFile:
 
     async def test_sanitizes_unsafe_filename(self, sample_video_path):
         payload = sample_video_path.read_bytes()
-        with patch("video_utils.aiohttp.ClientSession", return_value=self._mock_session(payload)):
+        with patch(
+            "video_utils.aiohttp.ClientSession",
+            return_value=self._mock_session(payload),
+        ):
             dest = await download_video_file(
                 "https://example.com/clip.mp4", r"..\..\evil:name?.mp4"
             )
@@ -187,7 +186,10 @@ class TestDownloadVideoFile:
 
     async def test_actual_size_too_large(self, sample_large_video_path):
         payload = sample_large_video_path.read_bytes()
-        with patch("video_utils.aiohttp.ClientSession", return_value=self._mock_session(payload)):
+        with patch(
+            "video_utils.aiohttp.ClientSession",
+            return_value=self._mock_session(payload),
+        ):
             with pytest.raises(VideoError, match="超过限制"):
                 await download_video_file(
                     "https://example.com/big.mp4", "big.mp4", max_size_mb=1
@@ -219,4 +221,6 @@ class TestDownloadVideoFile:
 
         with patch("video_utils.aiohttp.ClientSession", return_value=MockSession()):
             with pytest.raises(VideoError, match="HTTP 404"):
-                await download_video_file("https://example.com/missing.mp4", "missing.mp4")
+                await download_video_file(
+                    "https://example.com/missing.mp4", "missing.mp4"
+                )

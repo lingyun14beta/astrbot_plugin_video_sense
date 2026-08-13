@@ -89,7 +89,9 @@ class GeminiClient:
                 video.mime_type,
             )
         if self._use_files_api:
-            file_uri = await self.upload_file(video.path, video.mime_type, video.filename)
+            file_uri = await self.upload_file(
+                video.path, video.mime_type, video.filename
+            )
             return await self.analyze_file(file_uri, video.mime_type)
         size_mb = video.size_bytes / _MB
         raise GeminiClientError(
@@ -115,7 +117,9 @@ class GeminiClient:
             self._build_file_payload(file_uri, mime_type),
         )
 
-    async def upload_file(self, file_path: str, mime_type: str, display_name: str = "") -> str:
+    async def upload_file(
+        self, file_path: str, mime_type: str, display_name: str = ""
+    ) -> str:
         """通过 Files API resumable 协议上传文件，返回可引用的 file_uri。
 
         流程（官方文档）：

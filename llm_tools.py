@@ -3,11 +3,23 @@
 from __future__ import annotations
 
 try:
-    from .video_utils import VideoError, download_video_file, extract_file_component, load_video, load_video_from_path
     from .gemini_client import GeminiClient, GeminiClientError
+    from .video_utils import (
+        VideoError,
+        download_video_file,
+        extract_file_component,
+        load_video,
+        load_video_from_path,
+    )
 except ImportError:
-    from video_utils import VideoError, download_video_file, extract_file_component, load_video, load_video_from_path
     from gemini_client import GeminiClient, GeminiClientError
+    from video_utils import (
+        VideoError,
+        download_video_file,
+        extract_file_component,
+        load_video,
+        load_video_from_path,
+    )
 
 
 async def run_video_analysis(
@@ -56,6 +68,7 @@ async def resolve_video_ref(
 
     if item["is_local"]:
         from pathlib import Path
+
         if Path(ref).is_file():
             return ref
         raise VideoError(f"文件已过期或不可访问：{ref}")

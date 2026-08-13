@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -30,9 +29,7 @@ class TestNormalizeModel:
         assert GeminiClient._normalize_model("") == "gemini-2.0-flash"
 
     def test_whitespace(self):
-        assert (
-            GeminiClient._normalize_model("  gemini-pro  ") == "gemini-pro"
-        )
+        assert GeminiClient._normalize_model("  gemini-pro  ") == "gemini-pro"
 
 
 class TestIsOfficial:
@@ -129,7 +126,9 @@ class TestBuildPayload:
         )
         payload = client._build_payload(sample_video_base64, "video/mp4")
 
-        assert payload["system_instruction"]["parts"][0]["text"] == "Analyze this video."
+        assert (
+            payload["system_instruction"]["parts"][0]["text"] == "Analyze this video."
+        )
         assert len(payload["contents"]) == 1
         assert payload["contents"][0]["role"] == "user"
         assert len(payload["contents"][0]["parts"]) == 2
@@ -141,38 +140,34 @@ class TestBuildPayload:
 
 class TestParseResponse:
     def test_valid_response(self):
-        raw = json.dumps({
-            "candidates": [
-                {
-                    "content": {
-                        "parts": [
-                            {"text": "This is a beautiful video."}
-                        ]
-                    }
-                }
-            ]
-        })
+        raw = json.dumps(
+            {
+                "candidates": [
+                    {"content": {"parts": [{"text": "This is a beautiful video."}]}}
+                ]
+            }
+        )
         assert _parse_response(raw) == "This is a beautiful video."
 
     def test_multiple_parts_takes_first_text(self):
-        raw = json.dumps({
-            "candidates": [
-                {
-                    "content": {
-                        "parts": [
-                            {"text": ""},
-                            {"text": "Second part"},
-                        ]
+        raw = json.dumps(
+            {
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [
+                                {"text": ""},
+                                {"text": "Second part"},
+                            ]
+                        }
                     }
-                }
-            ]
-        })
+                ]
+            }
+        )
         assert _parse_response(raw) == "Second part"
 
     def test_error_response(self):
-        raw = json.dumps({
-            "error": {"message": "Invalid API key"}
-        })
+        raw = json.dumps({"error": {"message": "Invalid API key"}})
         with pytest.raises(GeminiClientError, match="API 返回错误"):
             _parse_response(raw)
 
@@ -182,17 +177,9 @@ class TestParseResponse:
             _parse_response(raw)
 
     def test_no_text_in_parts(self):
-        raw = json.dumps({
-            "candidates": [
-                {
-                    "content": {
-                        "parts": [
-                            {"inline_data": {}}
-                        ]
-                    }
-                }
-            ]
-        })
+        raw = json.dumps(
+            {"candidates": [{"content": {"parts": [{"inline_data": {}}]}}]}
+        )
         with pytest.raises(GeminiClientError, match="没有文本内容"):
             _parse_response(raw)
 
@@ -252,7 +239,10 @@ class _FakeResp:
 
 
 class _FakeSession:
-    """按调用顺序分发 post/put/get 响应的会话替身（模拟 aiohttp：方法为同步，返回上下文管理器）。"""
+    """按调用顺序分发 post/put/get 响应的会话替身。
+
+    模拟 aiohttp：方法为同步，返回上下文管理器。
+    """
 
     def __init__(self, post=None, put=None, gets=None):
         self._post = post
@@ -286,7 +276,9 @@ class TestBuildFilePayload:
             "https://generativelanguage.googleapis.com/v1beta/files/abc-123",
             "video/mp4",
         )
-        assert payload["system_instruction"]["parts"][0]["text"] == "Analyze this video."
+        assert (
+            payload["system_instruction"]["parts"][0]["text"] == "Analyze this video."
+        )
         part = payload["contents"][0]["parts"][0]
         assert part["file_data"]["mime_type"] == "video/mp4"
         assert part["file_data"]["file_uri"] == (
@@ -302,25 +294,36 @@ class TestBuildUploadUrl:
 
     def test_proxy_base_strips_suffix(self):
         client = GeminiClient(
-            api_key="k", model="m", system_prompt="s",
+            api_key="k",
+            model="m",
+            system_prompt="s",
             base_url="https://proxy.example.com/v1",
         )
-        assert client._build_upload_url() == "https://proxy.example.com/upload/v1beta/files"
+        assert (
+            client._build_upload_url()
+            == "https://proxy.example.com/upload/v1beta/files"
+        )
 
 
 class TestAnalyzeVideo:
     def _make_video(self, size_bytes, tmp_path, name="clip.mp4"):
         p = tmp_path / name
         p.write_bytes(b"\x00" * size_bytes)
-        return type("Video", (), {
-            "path": str(p),
-            "mime_type": "video/mp4",
-            "filename": name,
-            "size_bytes": size_bytes,
-        })()
+        return type(
+            "Video",
+            (),
+            {
+                "path": str(p),
+                "mime_type": "video/mp4",
+                "filename": name,
+                "size_bytes": size_bytes,
+            },
+        )()
 
     async def test_inline_branch(self, tmp_path):
-        client = GeminiClient(api_key="k", model="m", system_prompt="s", max_inline_size_mb=15)
+        client = GeminiClient(
+            api_key="k", model="m", system_prompt="s", max_inline_size_mb=15
+        )
         video = self._make_video(1024, tmp_path)
         client.analyze = AsyncMock(return_value="内嵌分析结果")
         client.upload_file = AsyncMock(return_value="uri")
@@ -330,7 +333,9 @@ class TestAnalyzeVideo:
         client.upload_file.assert_not_awaited()
 
     async def test_files_api_branch(self, tmp_path):
-        client = GeminiClient(api_key="k", model="m", system_prompt="s", max_inline_size_mb=1)
+        client = GeminiClient(
+            api_key="k", model="m", system_prompt="s", max_inline_size_mb=1
+        )
         video = self._make_video(2 * 1024 * 1024, tmp_path)
         client.upload_file = AsyncMock(return_value="https://gen/v1beta/files/1")
         client.analyze_file = AsyncMock(return_value="Files API 分析结果")
@@ -341,8 +346,11 @@ class TestAnalyzeVideo:
 
     async def test_files_api_disabled_and_too_large(self, tmp_path):
         client = GeminiClient(
-            api_key="k", model="m", system_prompt="s",
-            max_inline_size_mb=1, use_files_api=False,
+            api_key="k",
+            model="m",
+            system_prompt="s",
+            max_inline_size_mb=1,
+            use_files_api=False,
         )
         video = self._make_video(2 * 1024 * 1024, tmp_path)
         with pytest.raises(GeminiClientError, match="超过内嵌上限"):
@@ -359,15 +367,19 @@ class TestUploadFile:
         p.write_bytes(b"\x00" * 64)
         session = _FakeSession(
             post=_FakeResp(headers={"X-Goog-Upload-URL": "https://up.example.com/x"}),
-            put=_FakeResp(json_data={
-                "file": {
-                    "name": "files/abc-123",
-                    "uri": "https://generativelanguage.googleapis.com/v1beta/files/abc-123",
-                    "state": "ACTIVE",
-                },
-            }),
+            put=_FakeResp(
+                json_data={
+                    "file": {
+                        "name": "files/abc-123",
+                        "uri": "https://generativelanguage.googleapis.com/v1beta/files/abc-123",
+                        "state": "ACTIVE",
+                    },
+                }
+            ),
         )
-        with patch.object(GeminiClient, "_get_session", new=AsyncMock(return_value=session)):
+        with patch.object(
+            GeminiClient, "_get_session", new=AsyncMock(return_value=session)
+        ):
             uri = await client.upload_file(str(p), "video/mp4", "clip.mp4")
         assert uri == "https://generativelanguage.googleapis.com/v1beta/files/abc-123"
 
@@ -377,13 +389,31 @@ class TestUploadFile:
         p.write_bytes(b"\x00" * 64)
         session = _FakeSession(
             post=_FakeResp(headers={"X-Goog-Upload-URL": "https://up.example.com/x"}),
-            put=_FakeResp(json_data={"file": {"name": "files/1", "uri": "uri1", "state": "PROCESSING"}}),
+            put=_FakeResp(
+                json_data={
+                    "file": {"name": "files/1", "uri": "uri1", "state": "PROCESSING"}
+                }
+            ),
             gets=[
-                _FakeResp(json_data={"file": {"name": "files/1", "uri": "uri1", "state": "PROCESSING"}}),
-                _FakeResp(json_data={"file": {"name": "files/1", "uri": "uri1", "state": "ACTIVE"}}),
+                _FakeResp(
+                    json_data={
+                        "file": {
+                            "name": "files/1",
+                            "uri": "uri1",
+                            "state": "PROCESSING",
+                        }
+                    }
+                ),
+                _FakeResp(
+                    json_data={
+                        "file": {"name": "files/1", "uri": "uri1", "state": "ACTIVE"}
+                    }
+                ),
             ],
         )
-        with patch.object(GeminiClient, "_get_session", new=AsyncMock(return_value=session)):
+        with patch.object(
+            GeminiClient, "_get_session", new=AsyncMock(return_value=session)
+        ):
             uri = await client.upload_file(str(p), "video/mp4", "clip.mp4")
         assert uri == "uri1"
 
@@ -393,16 +423,20 @@ class TestUploadFile:
         p.write_bytes(b"\x00" * 64)
         session = _FakeSession(
             post=_FakeResp(headers={"X-Goog-Upload-URL": "https://up.example.com/x"}),
-            put=_FakeResp(json_data={
-                "file": {
-                    "name": "files/1",
-                    "uri": "uri1",
-                    "state": "FAILED",
-                    "error": {"message": "invalid video"},
-                },
-            }),
+            put=_FakeResp(
+                json_data={
+                    "file": {
+                        "name": "files/1",
+                        "uri": "uri1",
+                        "state": "FAILED",
+                        "error": {"message": "invalid video"},
+                    },
+                }
+            ),
         )
-        with patch.object(GeminiClient, "_get_session", new=AsyncMock(return_value=session)):
+        with patch.object(
+            GeminiClient, "_get_session", new=AsyncMock(return_value=session)
+        ):
             with pytest.raises(GeminiClientError, match="invalid video"):
                 await client.upload_file(str(p), "video/mp4", "clip.mp4")
 
@@ -411,7 +445,9 @@ class TestUploadFile:
         p = tmp_path / "clip.mp4"
         p.write_bytes(b"\x00" * 64)
         session = _FakeSession(post=_FakeResp(headers={}))
-        with patch.object(GeminiClient, "_get_session", new=AsyncMock(return_value=session)):
+        with patch.object(
+            GeminiClient, "_get_session", new=AsyncMock(return_value=session)
+        ):
             with pytest.raises(GeminiClientError, match="X-Goog-Upload-URL"):
                 await client.upload_file(str(p), "video/mp4", "clip.mp4")
 

@@ -61,6 +61,7 @@ class TestResolveVideoRef:
             "result": None,
         }
         from video_utils import VideoError
+
         with pytest.raises(VideoError, match="过期"):
             await resolve_video_ref(item, 20)
 
@@ -78,16 +79,20 @@ class TestResolveVideoRef:
 
             async def read(self):
                 return sample_video_path.read_bytes()
+
             async def __aenter__(self):
                 return self
+
             async def __aexit__(self, *args):
                 pass
 
         class MockSession:
             async def __aenter__(self):
                 return self
+
             async def __aexit__(self, *args):
                 pass
+
             def get(self, url):
                 return MockResp()
 
@@ -105,5 +110,6 @@ class TestResolveVideoRef:
             "result": None,
         }
         from video_utils import VideoError
+
         with pytest.raises(VideoError, match="为空"):
             await resolve_video_ref(item, 20)

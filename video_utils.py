@@ -54,6 +54,7 @@ def resolve_component_ref(comp) -> tuple[str, str]:
         if raw_file.startswith("file://") or raw_file.startswith("file:"):
             try:
                 from urllib.parse import unquote, urlparse
+
                 parsed = urlparse(raw_file)
                 local = unquote(parsed.path)
                 if local and local[0] == "/" and len(local) > 2 and local[2] == ":":
@@ -107,7 +108,9 @@ def _get_messages(event: AstrMessageEvent) -> list:
     return []
 
 
-async def load_video(file_comp, supported_formats: list[str], max_size_mb: int) -> VideoFile:
+async def load_video(
+    file_comp, supported_formats: list[str], max_size_mb: int
+) -> VideoFile:
     """校验并获取 File 组件的本地路径，返回 VideoFile（不读取内容）。"""
     name: str = getattr(file_comp, "name", "") or ""
     ext = _get_ext(name)
@@ -175,7 +178,9 @@ async def download_video_file(
     return dest
 
 
-async def _validate(local_path: str, ext: str, max_size_mb: int, filename: str) -> VideoFile:
+async def _validate(
+    local_path: str, ext: str, max_size_mb: int, filename: str
+) -> VideoFile:
     p = Path(local_path)
     if not p.is_file():
         raise VideoError("文件不存在或无法访问，请确认文件已上传完成。")

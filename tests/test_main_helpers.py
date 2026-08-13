@@ -19,18 +19,20 @@ def _stub_astrbot():
         sys.modules[name] = m
 
     stub_modules["astrbot.api"].AstrBotConfig = dict
-    stub_modules["astrbot.api"].llm_tool = lambda name=None: (lambda f: f)
+    stub_modules["astrbot.api"].llm_tool = lambda name=None: lambda f: f
     stub_modules["astrbot.api"].logger = SimpleNamespace(
         info=lambda *a, **k: None,
         warning=lambda *a, **k: None,
     )
-    stub_modules["astrbot.api.event"].AstrMessageEvent = type("AstrMessageEvent", (), {})
+    stub_modules["astrbot.api.event"].AstrMessageEvent = type(
+        "AstrMessageEvent", (), {}
+    )
 
     filter_mod = ModuleType("astrbot.api.event.filter")
     filter_mod.CustomFilter = type("CustomFilter", (), {})
-    filter_mod.custom_filter = lambda cls: (lambda f: f)
-    filter_mod.command = lambda name=None: (lambda f: f)
-    filter_mod.on_llm_request = lambda: (lambda f: f)
+    filter_mod.custom_filter = lambda cls: lambda f: f
+    filter_mod.command = lambda name=None: lambda f: f
+    filter_mod.on_llm_request = lambda: lambda f: f
     sys.modules["astrbot.api.event.filter"] = filter_mod
 
     stub_modules["astrbot.api.star"].Context = type("Context", (), {})
@@ -79,4 +81,7 @@ class TestExtractExtra:
         assert _main._extract_extra("hello", "分析视频") == ""
 
     def test_multi_space(self):
-        assert _main._extract_extra("/分析视频   1   这个视频", "分析视频") == "1   这个视频"
+        assert (
+            _main._extract_extra("/分析视频   1   这个视频", "分析视频")
+            == "1   这个视频"
+        )

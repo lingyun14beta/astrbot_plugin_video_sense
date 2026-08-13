@@ -16,15 +16,20 @@ from pathlib import Path
 from astrbot.api import AstrBotConfig, llm_tool, logger
 from astrbot.api.event import AstrMessageEvent
 from astrbot.api.event import filter as astr_filter
-from astrbot.api.star import Context, Star
 from astrbot.api.event.filter import CustomFilter
+from astrbot.api.star import Context, Star
 
-from .video_utils import VideoError, extract_file_component, load_video, resolve_component_ref
 from .gemini_client import GeminiClient, GeminiClientError
 from .llm_tools import (
     resolve_video_ref,
     run_video_analysis,
     run_video_analysis_from_path,
+)
+from .video_utils import (
+    VideoError,
+    extract_file_component,
+    load_video,
+    resolve_component_ref,
 )
 
 _DEFAULT_SYSTEM_PROMPT = (
@@ -115,7 +120,9 @@ class VideoSensePlugin(Star):
 
     @property
     def _command_system_prompt(self) -> str:
-        return self._analysis_cfg.get("command_system_prompt", _DEFAULT_SYSTEM_PROMPT).strip()
+        return self._analysis_cfg.get(
+            "command_system_prompt", _DEFAULT_SYSTEM_PROMPT
+        ).strip()
 
     def _resolve_provider_and_model(self) -> tuple[dict, str]:
         providers: list = self.config.get("api_provider", [])
@@ -142,7 +149,9 @@ class VideoSensePlugin(Star):
 
         return fallback_provider, fallback_model
 
-    def _make_client(self, extra_prompt: str = "", use_command_prompt: bool = False) -> GeminiClient:
+    def _make_client(
+        self, extra_prompt: str = "", use_command_prompt: bool = False
+    ) -> GeminiClient:
         provider, model = self._resolve_provider_and_model()
         if self._separate_prompts and use_command_prompt:
             sp = self._command_system_prompt
@@ -174,15 +183,28 @@ class VideoSensePlugin(Star):
             ext = Path(name).suffix.lstrip(".").lower()
             if ext not in self._supported_formats:
                 if self._debug:
-                    logger.info("[VideoSense] 跳过非视频文件：%s (扩展名 .%s)", name or "(无名称)", ext)
+                    logger.info(
+                        "[VideoSense] 跳过非视频文件：%s (扩展名 .%s)",
+                        name or "(无名称)",
+                        ext,
+                    )
                 return
             local, url = resolve_component_ref(comp)
             if local and Path(local).is_file():
-                items.append({"name": name, "ref": local, "is_local": True, "result": None})
+                items.append(
+                    {"name": name, "ref": local, "is_local": True, "result": None}
+                )
             else:
                 if self._debug and url:
                     logger.info("[VideoSense] 远程文件暂不自动分析：%s", name)
-                items.append({"name": name, "ref": url or local, "is_local": False, "result": None})
+                items.append(
+                    {
+                        "name": name,
+                        "ref": url or local,
+                        "is_local": False,
+                        "result": None,
+                    }
+                )
 
         new_items = []
         async with self._lock:
@@ -240,9 +262,13 @@ class VideoSensePlugin(Star):
 
             client = self._make_client()
             try:
-                result = await run_video_analysis_from_path(resolved, self._max_size_mb, client)
+                result = await run_video_analysis_from_path(
+                    resolved, self._max_size_mb, client
+                )
             except Exception:
-                logger.warning("[VideoSense] 自动分析失败：%s", item.get("name"), exc_info=True)
+                logger.warning(
+                    "[VideoSense] 自动分析失败：%s", item.get("name"), exc_info=True
+                )
                 return
             finally:
                 await client.close()
@@ -254,10 +280,15 @@ class VideoSensePlugin(Star):
                     logger.info("[VideoSense] 自动分析完成：%s", item.get("name"))
                 if self._inject_context:
                     async with self._lock:
-                        self._pending_injections.setdefault(umo, []).append({
-                            "role": "user",
-                            "content": f"[视频感知] 刚刚收到的视频「{item['name']}」分析：{result}",
-                        })
+                        self._pending_injections.setdefault(umo, []).append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    f"[视频感知] 刚刚收到的视频「{item['name']}」"
+                                    f"分析：{result}"
+                                ),
+                            }
+                        )
 
     @astr_filter.on_llm_request()
     async def _on_llm_request(self, event: AstrMessageEvent, req):
@@ -283,7 +314,9 @@ class VideoSensePlugin(Star):
 
         if file_comp is not None:
             yield event.plain_result("正在分析视频，请稍候...")
-            result = await self._analyze_file_comp(file_comp, extra, use_command_prompt=True)
+            result = await self._analyze_file_comp(
+                file_comp, extra, use_command_prompt=True
+            )
             yield event.plain_result(result)
             # 同步缓存结果（排除错误）
             if not _is_error(result):
@@ -307,7 +340,8 @@ class VideoSensePlugin(Star):
             )
             return
 
-        # 解析序号和追问："/分析视频 1 这个视频在干嘛" → idx=0, question="这个视频在干嘛"
+        # 解析序号和追问："分析视频 1 这个视频在干嘛"
+        # → idx=0, question="这个视频在干嘛"
         idx = -1
         question = ""
         if extra:
@@ -344,7 +378,9 @@ class VideoSensePlugin(Star):
         yield event.plain_result(f"正在分析「{item['name']}」，请稍候...")
         client = self._make_client(question, use_command_prompt=True)
         try:
-            result = await run_video_analysis_from_path(resolved, self._max_size_mb, client)
+            result = await run_video_analysis_from_path(
+                resolved, self._max_size_mb, client
+            )
             if not _is_error(result):
                 async with self._lock:
                     item["result"] = result
@@ -437,7 +473,9 @@ class VideoSensePlugin(Star):
 
         client = self._make_client()
         try:
-            result = await run_video_analysis_from_path(resolved_path, self._max_size_mb, client)
+            result = await run_video_analysis_from_path(
+                resolved_path, self._max_size_mb, client
+            )
             if not _is_error(result):
                 async with self._lock:
                     item["result"] = result
@@ -449,7 +487,9 @@ class VideoSensePlugin(Star):
     # 核心分析逻辑
     # ------------------------------------------------------------------
 
-    async def _analyze_file_comp(self, file_comp, extra_prompt: str = "", use_command_prompt: bool = False) -> str:
+    async def _analyze_file_comp(
+        self, file_comp, extra_prompt: str = "", use_command_prompt: bool = False
+    ) -> str:
         client = self._make_client(extra_prompt, use_command_prompt)
         try:
             video = await load_video(
@@ -483,5 +523,5 @@ def _extract_extra(message_str: str, command: str) -> str:
     text = message_str.strip()
     for prefix in (f"/{command}", command):
         if text.startswith(prefix):
-            return text[len(prefix):].strip()
+            return text[len(prefix) :].strip()
     return ""
