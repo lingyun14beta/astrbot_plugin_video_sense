@@ -124,22 +124,6 @@
         "type": "bool",
         "default": true
       },
-      "auto_analyze": {
-        "description": "自动分析视频",
-        "hint": "开启后，收到视频文件时自动调用 Gemini 分析，无需等待用户指令。仅本地文件生效。⚠ 每个视频都会消耗一次 API 调用。",
-        "type": "bool",
-        "default": false
-      },
-      "inject_context": {
-        "description": "注入分析结果到对话上下文",
-        "hint": "开启后，自动分析的结果会追加到对话历史中，LLM 可直接感知无需调用工具。需同时开启「自动分析视频」。",
-        "type": "bool",
-        "default": false,
-        "collapsed": true,
-        "condition": {
-          "auto_analyze": true
-        }
-      },
       "debug": {
         "description": "调试模式",
         "hint": "开启后，自动分析和缓存操作会在日志中输出详细信息，方便排查问题。",

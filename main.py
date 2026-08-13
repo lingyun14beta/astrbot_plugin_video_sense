@@ -1,7 +1,6 @@
 """astrbot_plugin_video_sense — 让 Bot 看懂视频。
 
-通过 Gemini 原生多模态视频理解，分析群里分享的视频文件，
-将结果注入对话历史，让 Bot 能就视频展开自然对话。
+分析群里分享的视频文件，让 Bot 能就视频展开自然对话。
 
   触发方式：
   - /分析视频 [序号] [追问] + 视频文件 或 引用视频消息
@@ -62,9 +61,7 @@ class VideoSensePlugin(Star):
         super().__init__(context)
         self.config: AstrBotConfig = config or {}
         self._registry: dict[str, list[dict]] = {}
-        self._pending_injections: dict[str, list[dict]] = {}
         self._lock = asyncio.Lock()
-        self._auto_sem = asyncio.Semaphore(2)  # 最多 2 个并发自动分析（视频请求更重）
         self._log_ffmpeg_status()
         logger.info("[VideoSense] 插件已加载，支持格式：%s", self._supported_formats)
 
@@ -135,14 +132,6 @@ class VideoSensePlugin(Star):
     @property
     def _system_prompt(self) -> str:
         return self._analysis_cfg.get("system_prompt", _DEFAULT_SYSTEM_PROMPT).strip()
-
-    @property
-    def _auto_analyze(self) -> bool:
-        return bool(self._analysis_cfg.get("auto_analyze", False))
-
-    @property
-    def _inject_context(self) -> bool:
-        return bool(self._analysis_cfg.get("inject_context", False))
 
     @property
     def _separate_prompts(self) -> bool:
@@ -234,8 +223,6 @@ class VideoSensePlugin(Star):
                     {"name": name, "ref": local, "is_local": True, "result": None}
                 )
             else:
-                if self._debug and url:
-                    logger.info("[VideoSense] 远程文件暂不自动分析：%s", name)
                 items.append(
                     {
                         "name": name,
@@ -245,36 +232,15 @@ class VideoSensePlugin(Star):
                     }
                 )
 
-        new_items = []
         async with self._lock:
             items = self._registry.setdefault(umo, [])
             for comp in getattr(event.message_obj, "message", []):
                 if type(comp).__name__ == "File":
-                    before = len(items)
                     _cache(comp, items)
-                    if len(items) > before:
-                        new_items.append(items[-1])
                 elif type(comp).__name__ == "Reply":
                     for rc in getattr(comp, "chain", []) or []:
                         if type(rc).__name__ == "File":
-                            before = len(items)
                             _cache(rc, items)
-                            if len(items) > before:
-                                new_items.append(items[-1])
-
-        if self._auto_analyze:
-            triggered = 0
-            for item in new_items:
-                if item["is_local"]:
-                    if self._debug:
-                        logger.info("[VideoSense] 触发自动分析：%s", item.get("name"))
-                    asyncio.create_task(self._auto_analyze_task(umo, item))
-                    triggered += 1
-            if self._debug and new_items and not triggered:
-                logger.info("[VideoSense] 所有新文件均为远程，跳过自动分析")
-
-        if self._debug and new_items:
-            logger.info("[VideoSense] 缓存完成：%d 个视频文件", len(new_items))
 
         # 缓存上限裁剪：保留最近的 N 个，避免长会话无限膨胀
         max_cached = self._max_cached_files
@@ -286,60 +252,6 @@ class VideoSensePlugin(Star):
                 logger.info("[VideoSense] 缓存超限，裁剪 %d 个最旧条目", overflow)
 
         yield
-
-    async def _auto_analyze_task(self, umo: str, item: dict) -> None:
-        """后台自动分析视频，可选注入对话上下文。"""
-        async with self._auto_sem:
-            async with self._lock:
-                if item["result"]:
-                    return
-            try:
-                resolved = await resolve_video_ref(item, self._max_size_mb)
-            except VideoError:
-                logger.warning("[VideoSense] 自动分析：文件不可用 %s", item.get("name"))
-                return
-
-            client = self._make_client()
-            try:
-                result = await run_video_analysis_from_path(
-                    resolved, self._max_size_mb, client
-                )
-            except Exception:
-                logger.warning(
-                    "[VideoSense] 自动分析失败：%s", item.get("name"), exc_info=True
-                )
-                return
-            finally:
-                await client.close()
-
-            if not _is_error(result):
-                async with self._lock:
-                    item["result"] = result
-                if self._debug:
-                    logger.info("[VideoSense] 自动分析完成：%s", item.get("name"))
-                if self._inject_context:
-                    async with self._lock:
-                        self._pending_injections.setdefault(umo, []).append(
-                            {
-                                "role": "user",
-                                "content": (
-                                    f"[视频感知] 刚刚收到的视频「{item['name']}」"
-                                    f"分析：{result}"
-                                ),
-                            }
-                        )
-
-    @astr_filter.on_llm_request()
-    async def _on_llm_request(self, event: AstrMessageEvent, req):
-        """每次 LLM 请求前注入待发送的分析结果。"""
-        if not self._inject_context:
-            return
-        async with self._lock:
-            pending = self._pending_injections.pop(event.unified_msg_origin, [])
-        if pending:
-            if self._debug:
-                logger.info("[VideoSense] 注入 %d 条分析到上下文", len(pending))
-            req.contexts.extend(pending)
 
     # ------------------------------------------------------------------
     # 指令处理
@@ -556,7 +468,6 @@ class VideoSensePlugin(Star):
 
     async def terminate(self) -> None:
         self._registry.clear()
-        self._pending_injections.clear()
         logger.info("[VideoSense] 插件已卸载")
 
 
