@@ -11,6 +11,7 @@ from gemini_client import (
     GeminiClient,
     GeminiClientError,
     _is_retryable_error,
+    _parse_openai_response,
     _parse_response,
 )
 
@@ -136,6 +137,144 @@ class TestBuildPayload:
         assert inline["mime_type"] == "video/mp4"
         assert inline["data"] == sample_video_base64
         assert payload["contents"][0]["parts"][1]["text"] == "请分析这段视频。"
+
+
+class TestProtocolSelection:
+    """协议判定：官方接口强制 Gemini；其余按模型名/protocol 配置。"""
+
+    def _client(self, model="gemini-2.0-flash", base_url="", protocol=""):
+        return GeminiClient(
+            api_key="k",
+            model=model,
+            system_prompt="s",
+            base_url=base_url,
+            protocol=protocol,
+        )
+
+    def test_official_force_gemini_even_with_openai_model(self):
+        client = self._client(model="qwen-vl-max")
+        assert client._is_gemini_protocol() is True
+
+    def test_gemini_model_on_proxy(self):
+        client = self._client(model="gemini-2.5-flash", base_url="https://proxy.example.com/v1")
+        assert client._is_gemini_protocol() is True
+
+    def test_qwen_model_on_proxy(self):
+        client = self._client(model="qwen-vl-max", base_url="https://proxy.example.com/v1")
+        assert client._is_gemini_protocol() is False
+
+    def test_gpt_model_on_proxy(self):
+        client = self._client(model="gpt-4o", base_url="https://proxy.example.com/v1")
+        assert client._is_gemini_protocol() is False
+
+    def test_forced_protocol(self):
+        client = self._client(
+            model="qwen-vl-max",
+            base_url="https://proxy.example.com/v1",
+            protocol="gemini",
+        )
+        assert client._is_gemini_protocol() is True
+        client = self._client(
+            model="gemini-2.0-flash",
+            base_url="https://proxy.example.com/v1",
+            protocol="openai",
+        )
+        assert client._is_gemini_protocol() is False
+
+
+class TestBuildUrlForOpenAIProtocol:
+    def test_openai_model_uses_chat_completions(self):
+        client = GeminiClient(
+            api_key="k",
+            model="qwen-vl-max",
+            system_prompt="s",
+            base_url="https://proxy.example.com/v1",
+        )
+        url = client._build_url()
+        assert url == "https://proxy.example.com/v1/chat/completions"
+
+    def test_openai_model_base_without_v1(self):
+        client = GeminiClient(
+            api_key="k",
+            model="qwen-vl-max",
+            system_prompt="s",
+            base_url="https://proxy.example.com",
+        )
+        assert client._build_url() == "https://proxy.example.com/chat/completions"
+
+    def test_openai_model_base_with_chat_completions_suffix(self):
+        client = GeminiClient(
+            api_key="k",
+            model="qwen-vl-max",
+            system_prompt="s",
+            base_url="https://proxy.example.com/v1/chat/completions",
+        )
+        assert client._build_url() == "https://proxy.example.com/v1/chat/completions"
+
+
+class TestBuildOpenAiPayload:
+    def test_payload_structure(self, sample_video_base64):
+        client = GeminiClient(
+            api_key="k",
+            model="qwen-vl-max",
+            system_prompt="分析这段视频。",
+        )
+        payload = client._build_openai_payload(sample_video_base64, "video/mp4")
+
+        assert payload["model"] == "qwen-vl-max"
+        assert payload["messages"][0] == {"role": "system", "content": "分析这段视频。"}
+        user_content = payload["messages"][1]["content"]
+        assert isinstance(user_content, list)
+        assert user_content[0] == {"type": "text", "text": "请分析这段视频。"}
+        video_part = user_content[1]
+        assert video_part["type"] == "video_url"
+        assert video_part["video_url"]["url"] == (
+            f"data:video/mp4;base64,{sample_video_base64}"
+        )
+
+
+class TestParseOpenAiResponse:
+    def test_valid_response(self):
+        raw = json.dumps(
+            {"choices": [{"message": {"content": "这是一段精彩的视频。"}}]}
+        )
+        assert _parse_openai_response(raw) == "这是一段精彩的视频。"
+
+    def test_error_response(self):
+        raw = json.dumps({"error": {"message": "Invalid API key"}})
+        with pytest.raises(GeminiClientError, match="API 返回错误"):
+            _parse_openai_response(raw)
+
+    def test_empty_choices(self):
+        raw = json.dumps({"choices": []})
+        with pytest.raises(GeminiClientError, match="空结果"):
+            _parse_openai_response(raw)
+
+    def test_no_content(self):
+        raw = json.dumps({"choices": [{"message": {"content": ""}}]})
+        with pytest.raises(GeminiClientError, match="没有文本内容"):
+            _parse_openai_response(raw)
+
+    def test_content_parts_list(self):
+        raw = json.dumps(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": [
+                                {"type": "text", "text": "第一段"},
+                                {"type": "text", "text": "第二段"},
+                            ]
+                        }
+                    }
+                ]
+            }
+        )
+        assert _parse_openai_response(raw) == "第一段第二段"
+
+    def test_invalid_json(self):
+        with pytest.raises(GeminiClientError, match="非 JSON"):
+            _parse_openai_response("not json {{{")
 
 
 class TestParseResponse:
@@ -371,6 +510,67 @@ class TestAnalyzeVideo:
         with pytest.raises(GeminiClientError, match="不支持 Files API"):
             await client.analyze_video(video)
         client.upload_file.assert_not_awaited()
+
+    async def test_openai_model_large_video_rejected(self, tmp_path):
+        """qwen 等 OpenAI 协议模型 + 大视频：提示压缩，不走 Files API。"""
+        client = GeminiClient(
+            api_key="k",
+            model="qwen-vl-max",
+            system_prompt="s",
+            base_url="https://proxy.example.com/v1",
+            max_inline_size_mb=1,
+            use_files_api=True,
+        )
+        video = self._make_video(2 * 1024 * 1024, tmp_path)
+        with pytest.raises(GeminiClientError, match="压缩或截取"):
+            await client.analyze_video(video)
+
+    async def test_openai_model_inline_uses_openai_payload(self, tmp_path):
+        """qwen 模型小视频：使用 OpenAI 协议请求（chat/completions + video_url）。"""
+        client = GeminiClient(
+            api_key="k",
+            model="qwen-vl-max",
+            system_prompt="s",
+            base_url="https://proxy.example.com/v1",
+        )
+        video = self._make_video(1024, tmp_path)
+        sent = {}
+
+        async def fake_post(url, headers, payload):
+            sent["url"] = url
+            sent["payload"] = payload
+            return "分析结果"
+
+        client._post = fake_post
+        result = await client.analyze_video(video)
+        assert result == "分析结果"
+        assert sent["url"] == "https://proxy.example.com/v1/chat/completions"
+        assert sent["payload"]["model"] == "qwen-vl-max"
+        video_part = sent["payload"]["messages"][1]["content"][1]
+        assert video_part["type"] == "video_url"
+        assert video_part["video_url"]["url"].startswith("data:video/mp4;base64,")
+
+    async def test_gemini_model_inline_uses_gemini_payload(self, tmp_path):
+        """gemini 模型小视频：使用 Gemini 协议请求（generateContent + inline_data）。"""
+        client = GeminiClient(
+            api_key="k",
+            model="gemini-2.0-flash",
+            system_prompt="s",
+            base_url="https://proxy.example.com/v1",
+        )
+        video = self._make_video(1024, tmp_path)
+        sent = {}
+
+        async def fake_post(url, headers, payload):
+            sent["url"] = url
+            sent["payload"] = payload
+            return "分析结果"
+
+        client._post = fake_post
+        result = await client.analyze_video(video)
+        assert result == "分析结果"
+        assert sent["url"].endswith(":generateContent")
+        assert "inline_data" in sent["payload"]["contents"][0]["parts"][0]
 
 
 class TestUploadFile:

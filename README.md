@@ -79,9 +79,10 @@ mp4、mov、webm、avi、mpeg、mpg、flv、wmv、3gpp（官方支持的视频�
 | API Key | 中转站提供的访问密钥 |
 | Base URL | 中转站地址，如 `https://xxx.com/v1` |
 | 模型名称 | 按中转站实际支持的模型填写 |
+| 协议（可选） | 留空自动判断：模型名含 `gemini` 走 Gemini 协议，其他模型走 OpenAI 兼容协议；可强制指定 `gemini` / `openai` |
 | 超时时间 | 建议不低于 180 秒 |
 
-> 中转站需支持 Gemini `generateContent` 接口且支持视频输入。
+> **协议自动选择**：模型名包含 `gemini` 时使用 Gemini 协议（`generateContent` 端点）；其他模型（如 `qwen-vl-max`、`gpt-4o` 等）自动使用 OpenAI 兼容协议（`/v1/chat/completions`，视频通过 `video_url` data URL 内嵌）。中转站需支持对应协议与视频输入。
 
 ### 分析设置
 
@@ -101,7 +102,7 @@ mp4、mov、webm、avi、mpeg、mpg、flv、wmv、3gpp（官方支持的视频�
 | 启用 LLM 工具调用 | 开启后 Bot 可主动分析 | 开启 |
 | 最大文件大小 | 文件总大小上限，超过直接拒绝（Files API 免费层 2GB） | 100 MB |
 | 内嵌传输上限 | ≤ 此大小用内嵌传输（请求体含 base64 约膨胀 33%，官方上限 20MB），超过走 Files API | 15 MB |
-| 启用 Files API | 超过内嵌上限时通过官方 Files API 上传（仅官方接口，中转站需关闭） | 开启 |
+| 启用 Files API | 超过内嵌上限时通过官方 Files API 上传（仅 Gemini 官方接口；OpenAI 兼容协议不支持大文件，请压缩） | 开启 |
 | 每会话缓存视频数上限 | 超出自动丢弃最旧条目 | 50 |
 | 支持的视频格式 | 仅列表内格式会被缓存 | mp4/mov/webm/avi/mpeg/mpg/flv/wmv/3gpp |
 | 自动分析视频 | 收到本地视频文件时自动分析（远程文件仍会记录，可用指令或工具手动触发下载分析） | 关闭 |

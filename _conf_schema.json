@@ -39,7 +39,7 @@
       },
       "openai_compat": {
         "name": "OpenAI 兼容中转站",
-        "hint": "使用支持 Gemini generateContent 接口的中转站，通过 Bearer 鉴权。",
+        "hint": "支持 Gemini generateContent 或 OpenAI chat/completions 接口的中转站，通过 Bearer 鉴权。模型名含 gemini 时自动走 Gemini 协议，其他模型（如 qwen-vl）自动走 OpenAI 兼容协议。",
         "display_item": "name",
         "hide_hint_in_list": true,
         "items": {
@@ -63,9 +63,16 @@
           },
           "model": {
             "description": "模型名称",
-            "hint": "按中转站实际支持的模型填写，如 gemini-2.0-flash。",
+            "hint": "模型名含 gemini 走 Gemini 协议；其他模型（qwen-vl、gpt-4o 等）走 OpenAI 兼容协议。",
             "type": "string",
             "default": "gemini-2.0-flash"
+          },
+          "protocol": {
+            "description": "协议（可选）",
+            "hint": "留空自动判断：模型名含 gemini 走 Gemini 协议，否则走 OpenAI 兼容协议。可强制指定 gemini 或 openai。",
+            "type": "string",
+            "default": "",
+            "collapsed": true
           },
           "timeout": {
             "description": "超时时间（秒）",

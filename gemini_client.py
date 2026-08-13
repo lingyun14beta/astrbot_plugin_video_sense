@@ -1,9 +1,12 @@
-"""Gemini 视频分析客户端，同时支持官方 API 和 OpenAI 兼容中转站。
+"""视频分析客户端，支持 Gemini 协议与 OpenAI 兼容协议。
+
+协议选择（按模型名自动判断，可用 protocol 参数强制）：
+- 模型名包含 "gemini"（或官方接口）→ Gemini 协议（generateContent）
+- 其他模型（qwen-vl、gpt 等）→ OpenAI 兼容协议（/v1/chat/completions）
 
 传输方式：
-- 内嵌传输（inline_data）：文件 ≤ max_inline_size_mb，总请求体受官方 20MB 限制。
-- Files API（官方推荐，免费层 2GB）：文件超过内嵌上限时使用 resumable 协议上传，
-  再通过 file_data 引用，支持更长的视频。
+- 内嵌传输（inline_data / video_url data URL）：文件 ≤ max_inline_size_mb。
+- Files API（官方推荐，免费层 2GB）：仅 Gemini 官方接口 + 大文件时使用。
   参考：https://ai.google.dev/gemini-api/docs/files
 """
 
@@ -36,13 +39,17 @@ _HTTP_5XX_MIN = 500
 _FILE_STATE_ACTIVE = "ACTIVE"
 _FILE_STATE_FAILED = "FAILED"
 
+_PROTOCOL_AUTO = "auto"
+_PROTOCOL_GEMINI = "gemini"
+_PROTOCOL_OPENAI = "openai"
+
 
 class GeminiClientError(Exception):
-    """Gemini 调用失败，message 可直接透传给 LLM。"""
+    """API 调用失败，message 可直接透传给 LLM。"""
 
 
 class GeminiClient:
-    """向 Gemini generateContent 接口发送视频分析请求。
+    """向视频理解 API 发送分析请求，自动选择协议与传输方式。
 
     同时支持官方 API（x-goog-api-key 鉴权）和 OpenAI 兼容中转站（Bearer 鉴权）。
     接入模式根据 base_url 的 host 自动判断。
@@ -58,6 +65,7 @@ class GeminiClient:
         retry_times: int = 2,
         max_inline_size_mb: int = 15,
         use_files_api: bool = True,
+        protocol: str = _PROTOCOL_AUTO,
     ) -> None:
         self._api_key = api_key.strip()
         self._model = self._normalize_model(model)
@@ -67,6 +75,7 @@ class GeminiClient:
         self._retry_times = retry_times
         self._max_inline_size_mb = max(0, int(max_inline_size_mb))
         self._use_files_api = bool(use_files_api)
+        self._protocol = (protocol or _PROTOCOL_AUTO).strip().lower()
         self._session: aiohttp.ClientSession | None = None
 
     # ------------------------------------------------------------------
@@ -74,7 +83,7 @@ class GeminiClient:
     # ------------------------------------------------------------------
 
     async def analyze_video(self, video) -> str:
-        """分析一个视频文件（VideoFile），自动选择传输方式。
+        """分析一个视频文件（VideoFile），自动选择协议与传输方式。
 
         Args:
             video: 具有 path / mime_type / filename / size_bytes 属性的对象。
@@ -87,6 +96,13 @@ class GeminiClient:
             return await self.analyze(
                 await self._read_base64(video.path),
                 video.mime_type,
+            )
+        if not self._is_gemini_protocol():
+            size_mb = video.size_bytes / _MB
+            raise GeminiClientError(
+                f"文件 {size_mb:.1f} MB 超过内嵌上限 {self._max_inline_size_mb} MB，"
+                "OpenAI 兼容协议不支持 Files API 大文件上传，"
+                "请压缩或截取视频片段后重试。",
             )
         if self._use_files_api:
             if not self._is_official():
@@ -108,12 +124,16 @@ class GeminiClient:
         )
 
     async def analyze(self, video_b64: str, mime_type: str) -> str:
-        """内嵌传输：分析视频，返回 Gemini 的文字描述。"""
+        """内嵌传输：分析视频，返回文字描述（按协议自动选择请求格式）。"""
         self._require_api_key()
+        if self._is_gemini_protocol():
+            payload = self._build_payload(video_b64, mime_type)
+        else:
+            payload = self._build_openai_payload(video_b64, mime_type)
         return await self._request_text(
             self._build_url(),
             self._build_headers(),
-            self._build_payload(video_b64, mime_type),
+            payload,
         )
 
     async def analyze_file(self, file_uri: str, mime_type: str) -> str:
@@ -285,13 +305,28 @@ class GeminiClient:
         except Exception:
             return False
 
+    def _is_gemini_protocol(self) -> bool:
+        """协议判定：官方接口强制 Gemini；否则按 protocol 配置或模型名判断。"""
+        if self._is_official():
+            return True
+        if self._protocol == _PROTOCOL_GEMINI:
+            return True
+        if self._protocol == _PROTOCOL_OPENAI:
+            return False
+        return "gemini" in self._model.lower()
+
     def _build_url(self) -> str:
         base = self._effective_base()
-        for suffix in ("/v1/chat/completions", "/v1beta/openai", "/v1beta", "/v1"):
-            if base.endswith(suffix):
-                base = base[: -len(suffix)]
-                break
-        return f"{base}/v1beta/models/{self._model}:generateContent"
+        if self._is_gemini_protocol():
+            for suffix in ("/v1/chat/completions", "/v1beta/openai", "/v1beta", "/v1"):
+                if base.endswith(suffix):
+                    base = base[: -len(suffix)]
+                    break
+            return f"{base}/v1beta/models/{self._model}:generateContent"
+        # OpenAI 兼容协议
+        if base.endswith("/chat/completions"):
+            return base  # base 已包含完整端点，原样使用
+        return f"{base}/chat/completions"
 
     def _build_upload_url(self) -> str:
         base = self._effective_base()
@@ -354,6 +389,27 @@ class GeminiClient:
             ],
         }
 
+    def _build_openai_payload(self, video_b64: str, mime_type: str) -> dict:
+        """OpenAI 兼容协议请求体：视频通过 video_url data URL 内嵌。"""
+        return {
+            "model": self._model,
+            "messages": [
+                {"role": "system", "content": self._system_prompt},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "请分析这段视频。"},
+                        {
+                            "type": "video_url",
+                            "video_url": {
+                                "url": f"data:{mime_type};base64,{video_b64}",
+                            },
+                        },
+                    ],
+                },
+            ],
+        }
+
     async def _post(
         self,
         url: str,
@@ -366,7 +422,9 @@ class GeminiClient:
                 raw = await resp.text()
 
                 if resp.status == _HTTP_OK:
-                    return _parse_response(raw)
+                    if self._is_gemini_protocol():
+                        return _parse_response(raw)
+                    return _parse_openai_response(raw)
 
                 msg = _extract_error_message(raw) or f"HTTP {resp.status}"
                 if _HTTP_4XX_MIN <= resp.status < _HTTP_5XX_MIN:
@@ -409,6 +467,42 @@ def _parse_response(raw: str) -> str:
         text = part.get("text", "")
         if text and text.strip():
             return text.strip()
+
+    raise GeminiClientError("API 返回结果中没有文本内容。")
+
+
+def _parse_openai_response(raw: str) -> str:
+    """解析 OpenAI 兼容协议响应（chat/completions），返回文本内容。"""
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise GeminiClientError(f"响应解析失败（非 JSON）：{e}") from e
+
+    if isinstance(data, dict) and data.get("error"):
+        err = data["error"]
+        msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+        raise GeminiClientError(f"API 返回错误：{msg}")
+
+    choices = data.get("choices") or []
+    if not choices:
+        raise GeminiClientError(
+            "API 返回空结果（choices 为空），可能触发了内容过滤。",
+        )
+
+    message = choices[0].get("message") or {}
+    content = message.get("content")
+    if isinstance(content, str) and content.strip():
+        return content.strip()
+    # 部分模型以内容块列表返回（多模态输出）
+    if isinstance(content, list):
+        texts = [
+            part.get("text", "")
+            for part in content
+            if isinstance(part, dict) and part.get("text")
+        ]
+        joined = "".join(texts).strip()
+        if joined:
+            return joined
 
     raise GeminiClientError("API 返回结果中没有文本内容。")
 

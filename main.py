@@ -167,6 +167,7 @@ class VideoSensePlugin(Star):
             timeout=int(provider.get("timeout", 300)),
             max_inline_size_mb=self._max_inline_mb,
             use_files_api=self._use_files_api,
+            protocol=str(provider.get("protocol", "auto") or "auto"),
         )
 
     # ------------------------------------------------------------------
