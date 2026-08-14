@@ -155,3 +155,36 @@ class TestBackgroundAnalysis:
         await task  # 不应抛出
 
         send.assert_awaited_once()
+
+
+class TestVideoHintInjection:
+    """视频感知提示注入：引导 LLM 调用分析工具，每视频仅提示一次。"""
+
+    def _make_plugin(self):
+        plugin, _ = TestBackgroundAnalysis()._make_plugin()
+        return plugin
+
+    async def test_pending_hint_injected_once(self):
+        plugin = self._make_plugin()
+        # 模拟缓存钩子记录的新视频提示
+        plugin._pending_hints["umo1"] = ["clip.mp4"]
+        plugin._video_hints["umo1"] = {"clip.mp4"}
+
+        req = SimpleNamespace(contexts=[])
+        event = SimpleNamespace(unified_msg_origin="umo1")
+
+        await plugin._on_llm_request(event, req)
+        assert len(req.contexts) == 1
+        assert "视频感知" in req.contexts[0]["content"]
+        assert "clip.mp4" in req.contexts[0]["content"]
+
+        # 注入后 pending 清空，第二次不再注入
+        await plugin._on_llm_request(event, req)
+        assert len(req.contexts) == 1
+
+    async def test_no_pending_no_injection(self):
+        plugin = self._make_plugin()
+        req = SimpleNamespace(contexts=[])
+        event = SimpleNamespace(unified_msg_origin="umo1")
+        await plugin._on_llm_request(event, req)
+        assert req.contexts == []

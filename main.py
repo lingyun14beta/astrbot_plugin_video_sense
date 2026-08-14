@@ -64,6 +64,8 @@ class VideoSensePlugin(Star):
         self._registry: dict[str, list[dict]] = {}
         self._lock = asyncio.Lock()
         self._bg_tasks: set[asyncio.Task] = set()
+        self._video_hints: dict[str, set[str]] = {}  # umo -> 已提示过 LLM 的视频名
+        self._pending_hints: dict[str, list[str]] = {}  # umo -> 待注入的视频名
         self._log_ffmpeg_status()
         logger.info("[VideoSense] 插件已加载，支持格式：%s", self._supported_formats)
 
@@ -222,22 +224,20 @@ class VideoSensePlugin(Star):
                     )
                 return
             local, url = resolve_component_ref(comp)
-            if local and Path(local).is_file():
-                items.append(
-                    {"name": name, "ref": local, "is_local": True, "result": None}
-                )
-            else:
-                items.append(
-                    {
-                        "name": name,
-                        "ref": url or local,
-                        "is_local": False,
-                        "result": None,
-                    }
-                )
+            ref = local if (local and Path(local).is_file()) else (url or local)
+            is_local = bool(local and Path(local).is_file())
+            # 去重：同名同引用的视频（如反复引用同一消息）只缓存一次
+            for it in items:
+                if it["name"] == name and it["ref"] == ref:
+                    return
+            items.append(
+                {"name": name, "ref": ref, "is_local": is_local, "result": None}
+            )
 
+        new_hints = []
         async with self._lock:
             items = self._registry.setdefault(umo, [])
+            hinted = self._video_hints.setdefault(umo, set())
             for comp in getattr(event.message_obj, "message", []):
                 if type(comp).__name__ in ("File", "Video"):
                     _cache(comp, items)
@@ -245,6 +245,13 @@ class VideoSensePlugin(Star):
                     for rc in getattr(comp, "chain", []) or []:
                         if type(rc).__name__ in ("File", "Video"):
                             _cache(rc, items)
+            # 记录需要提示 LLM 的新视频（去重后新增的、未提示过的）
+            for item in items:
+                if item["name"] not in hinted:
+                    new_hints.append(item["name"])
+                    hinted.add(item["name"])
+            if new_hints:
+                self._pending_hints.setdefault(umo, []).extend(new_hints)
 
         # 缓存上限裁剪：保留最近的 N 个，避免长会话无限膨胀
         max_cached = self._max_cached_files
@@ -256,6 +263,36 @@ class VideoSensePlugin(Star):
                 logger.info("[VideoSense] 缓存超限，裁剪 %d 个最旧条目", overflow)
 
         yield
+
+    # ------------------------------------------------------------------
+    # 视频感知提示（引导 LLM 调用分析工具）
+    # ------------------------------------------------------------------
+
+    @astr_filter.on_llm_request()
+    async def _on_llm_request(self, event: AstrMessageEvent, req):
+        """每次 LLM 请求前注入"对话中有视频"提示（每视频仅一次，不消耗 API）。
+
+        LLM 上下文中视频消息只是占位符，它不知道视频可分析，
+        此提示引导它调用 list_video_files / analyze_current_video。
+        """
+        umo = event.unified_msg_origin
+        async with self._lock:
+            pending = self._pending_hints.pop(umo, [])
+        if not pending:
+            return
+        names = "、".join(pending[:5])
+        req.contexts.append(
+            {
+                "role": "user",
+                "content": (
+                    f"[视频感知] 本对话中有视频文件：{names}。"
+                    "如果用户提到视频、想看视频内容或询问视频里有什么，"
+                    "请调用 list_video_files 或 analyze_current_video 工具分析视频。"
+                ),
+            }
+        )
+        if self._debug:
+            logger.info("[VideoSense] 已注入视频感知提示：%s", names)
 
     # ------------------------------------------------------------------
     # 后台分析（LLM 工具场景：立即返回，结果主动发送）
@@ -381,7 +418,7 @@ class VideoSensePlugin(Star):
     @llm_tool("analyze_current_video")
     async def analyze_current_video(self, event: AstrMessageEvent, question: str = ""):
         """分析当前消息或引用消息中的视频文件。
-        当用户直接发送了视频并希望 bot 理解、评价时调用。
+        当用户直接发送了视频、引用含视频的消息，或询问视频内容时调用。
 
         Args:
             question(str, optional): 用户对视频的具体追问，如"这个视频在干嘛？"
@@ -426,7 +463,8 @@ class VideoSensePlugin(Star):
     @llm_tool("list_video_files")
     async def list_video_files(self, event: AstrMessageEvent):
         """列出当前对话中出现过的所有视频文件及其序号。
-        当用户提到之前的视频但未指定具体哪个时调用。
+        当用户提到视频、询问对话中的视频，或用户发过视频但未指定具体哪个时调用。
+        调用后再用 analyze_video_by_number 分析指定视频。
         """
         umo = event.unified_msg_origin
         async with self._lock:
@@ -529,6 +567,8 @@ class VideoSensePlugin(Star):
             task.cancel()
         self._bg_tasks.clear()
         self._registry.clear()
+        self._video_hints.clear()
+        self._pending_hints.clear()
         logger.info("[VideoSense] 插件已卸载")
 
 
