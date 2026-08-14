@@ -156,6 +156,35 @@ class TestBackgroundAnalysis:
 
         send.assert_awaited_once()
 
+    async def test_ai_delivers_when_wakeup_succeeds(self):
+        """AI 唤醒成功发送时，插件不再直接发送（避免重复消息）。"""
+        plugin, send = self._make_plugin()
+        plugin._wake_ai_for_result = AsyncMock(return_value=True)
+
+        async def fake_coro():
+            return "分析结果"
+
+        plugin._run_background_analysis("umo1", fake_coro())
+        task = next(iter(plugin._bg_tasks))
+        await task
+
+        send.assert_not_awaited()
+
+    async def test_wakeup_failure_falls_back_to_direct_send(self):
+        """AI 唤醒失败（异常）时回退为直接发送。"""
+        plugin, send = self._make_plugin()
+        plugin._wake_ai_for_result = AsyncMock(side_effect=RuntimeError("唤醒失败"))
+
+        async def fake_coro():
+            return "分析结果"
+
+        plugin._run_background_analysis("umo1", fake_coro())
+        task = next(iter(plugin._bg_tasks))
+        await task
+
+        send.assert_awaited_once()
+        assert "分析结果" in str(send.await_args.args[1])
+
 
 class TestVideoHintInjection:
     """视频感知提示注入：引导 LLM 调用分析工具，每视频仅提示一次。"""

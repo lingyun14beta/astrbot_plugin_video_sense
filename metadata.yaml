@@ -2,7 +2,7 @@ name: astrbot_plugin_video_sense
 display_name: 视频感知
 short_desc: 让 Bot 看懂视频，分析群里分享的视频文件。
 desc: 让 Bot 看懂视频，分析群里分享的视频文件的画面、内容与氛围。
-version: v0.5.2
+version: v0.6.0
 author: lingyun
 repo: https://github.com/lingyun14beta/astrbot_plugin_video_sense
 social_link: https://github.com/lingyun14beta

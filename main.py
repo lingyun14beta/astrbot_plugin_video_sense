@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 
 from astrbot.api import AstrBotConfig, llm_tool, logger
@@ -295,11 +296,11 @@ class VideoSensePlugin(Star):
             logger.info("[VideoSense] 已注入视频感知提示：%s", names)
 
     # ------------------------------------------------------------------
-    # 后台分析（LLM 工具场景：立即返回，结果主动发送）
+    # 后台分析（LLM 工具场景：立即返回，结果唤醒 AI 发送）
     # ------------------------------------------------------------------
 
     def _run_background_analysis(self, umo: str, coro) -> None:
-        """后台执行分析协程，结果主动发送到会话；任何异常兜底通知。
+        """后台执行分析协程，完成后唤醒主 Agent 以角色口吻发送结果。
 
         AstrBot 对 LLM 工具调用有 120 秒硬超时，视频分析可能超时，
         故工具只提交任务立即返回，耗时分析在此后台执行（无超时限制）。
@@ -310,13 +311,130 @@ class VideoSensePlugin(Star):
                 result = await coro
             except Exception as e:
                 logger.error("[VideoSense] 后台分析异常", exc_info=True)
-                await self._safe_send(umo, f"视频分析失败：{e}")
+                await self._deliver_result(umo, f"视频分析失败：{e}")
                 return
-            await self._safe_send(umo, result)
+            await self._deliver_result(umo, result)
 
         task = asyncio.create_task(_wrapper())
         self._bg_tasks.add(task)
         task.add_done_callback(self._bg_tasks.discard)
+
+    async def _deliver_result(self, umo: str, result_text: str) -> None:
+        """交付分析结果：优先唤醒 AI 以角色口吻发送，失败兜底直接发送。"""
+        try:
+            sent = await self._wake_ai_for_result(umo, result_text)
+        except Exception as e:
+            logger.warning("[VideoSense] 唤醒 AI 发送失败，改为直接发送：%s", e)
+            sent = False
+        if not sent:
+            await self._safe_send(umo, result_text)
+
+    async def _wake_ai_for_result(self, umo: str, result_text: str) -> bool:
+        """唤醒主 Agent 处理视频分析结果（借鉴 image_generation 的任务完成唤醒机制）。
+
+        构造一次带完整会话上下文的主动 Agent 回合，让 LLM 用角色口吻
+        通过 send_message_to_user 把结果发送给用户。
+
+        Returns:
+            AI 是否成功发送了消息。
+        """
+        from astrbot.core.agent.tool import ToolSet
+        from astrbot.core.astr_main_agent import (
+            MainAgentBuildConfig,
+            _get_session_conv,
+            build_main_agent,
+        )
+        from astrbot.core.cron.events import CronMessageEvent
+        from astrbot.core.platform.message_session import MessageSession
+        from astrbot.core.provider.entities import ProviderRequest
+        from astrbot.core.tools.message_tools import SendMessageToUserTool
+
+        system_prompt = (
+            "你是一个自主 Agent。你被唤醒是因为之前提交的视频分析任务已完成。\n"
+            "# 重要规则\n"
+            "1. 这不是普通对话回合，不要寒暄，不要提问。\n"
+            "2. 你必须使用 send_message_to_user 工具把分析结果发送给用户，否则用户看不到。\n"
+            "3. 用你平时的角色口吻组织语言（保持人设），但不要改变事实内容。\n"
+            "4. 如果任务失败，用角色口吻简要说明失败原因。\n"
+            "# 视频分析结果\n"
+            f"{result_text}"
+        )
+
+        session = MessageSession.from_str(umo)
+        cron_event = CronMessageEvent(
+            context=self.context,
+            session=session,
+            message=f"视频分析任务完成：{result_text[:100]}",
+            sender_id="astrbot",
+            sender_name="VideoSense",
+            message_type=session.message_type,
+        )
+
+        cfg = self.context.get_config(umo=umo)
+        provider_settings = cfg.get("provider_settings", {})
+        tool_call_timeout = provider_settings.get("tool_call_timeout", 120)
+        provider = self.context.get_using_provider(umo)
+
+        req = ProviderRequest()
+        req.conversation = await _get_session_conv(
+            event=cron_event,
+            plugin_context=self.context,
+        )
+        history_context = json.loads(req.conversation.history or "[]")
+        if history_context:
+            req.contexts = history_context
+            context_dump = req._print_friendly_context()
+            req.contexts = []
+            req.system_prompt += (
+                f"\n\n以下是你和用户之前的对话历史：\n---\n{context_dump}\n---\n"
+            )
+        req.system_prompt += system_prompt
+        req.prompt = "请按系统指令把视频分析结果发送给用户。"
+        req.func_tool = ToolSet()
+        req.func_tool.add_tool(
+            self.context.get_llm_tool_manager().get_builtin_tool(SendMessageToUserTool)
+        )
+
+        config = MainAgentBuildConfig(
+            tool_call_timeout=tool_call_timeout,
+            llm_safety_mode=False,
+            streaming_response=False,
+            provider_settings=provider_settings,
+            computer_use_runtime="none",
+            add_cron_tools=False,
+        )
+        result = await build_main_agent(
+            event=cron_event,
+            plugin_context=self.context,
+            config=config,
+            provider=provider,
+            req=req,
+            apply_reset=False,
+        )
+        if not result:
+            return False
+
+        # 裁剪工具：本次主动回合只允许发送消息
+        result.provider_request.func_tool = ToolSet()
+        result.provider_request.func_tool.add_tool(
+            self.context.get_llm_tool_manager().get_builtin_tool(SendMessageToUserTool)
+        )
+        if result.reset_coro:
+            await result.reset_coro
+
+        sent = False
+        runner = result.agent_runner
+        async for agent_resp in runner.step_until_done(30):
+            if agent_resp.type != "tool_call_result":
+                continue
+            chain = agent_resp.data.get("chain")
+            if not chain:
+                continue
+            content = chain.get_plain_text(with_other_comps_mark=True)
+            if "Message sent to session" in content:
+                sent = True
+                break
+        return sent
 
     async def _safe_send(self, umo: str, text: str) -> None:
         """向会话主动发送文本，失败仅记日志（不中断后台任务）。"""
