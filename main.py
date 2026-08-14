@@ -13,7 +13,7 @@ import asyncio
 from pathlib import Path
 
 from astrbot.api import AstrBotConfig, llm_tool, logger
-from astrbot.api.event import AstrMessageEvent
+from astrbot.api.event import AstrMessageEvent, MessageChain
 from astrbot.api.event import filter as astr_filter
 from astrbot.api.event.filter import CustomFilter
 from astrbot.api.star import Context, Star
@@ -63,6 +63,7 @@ class VideoSensePlugin(Star):
         self.config: AstrBotConfig = config or {}
         self._registry: dict[str, list[dict]] = {}
         self._lock = asyncio.Lock()
+        self._bg_tasks: set[asyncio.Task] = set()
         self._log_ffmpeg_status()
         logger.info("[VideoSense] 插件已加载，支持格式：%s", self._supported_formats)
 
@@ -257,6 +258,37 @@ class VideoSensePlugin(Star):
         yield
 
     # ------------------------------------------------------------------
+    # 后台分析（LLM 工具场景：立即返回，结果主动发送）
+    # ------------------------------------------------------------------
+
+    def _run_background_analysis(self, umo: str, coro) -> None:
+        """后台执行分析协程，结果主动发送到会话；任何异常兜底通知。
+
+        AstrBot 对 LLM 工具调用有 120 秒硬超时，视频分析可能超时，
+        故工具只提交任务立即返回，耗时分析在此后台执行（无超时限制）。
+        """
+
+        async def _wrapper() -> None:
+            try:
+                result = await coro
+            except Exception as e:
+                logger.error("[VideoSense] 后台分析异常", exc_info=True)
+                await self._safe_send(umo, f"视频分析失败：{e}")
+                return
+            await self._safe_send(umo, result)
+
+        task = asyncio.create_task(_wrapper())
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+
+    async def _safe_send(self, umo: str, text: str) -> None:
+        """向会话主动发送文本，失败仅记日志（不中断后台任务）。"""
+        try:
+            await self.context.send_message(umo, MessageChain().message(text))
+        except Exception:
+            logger.warning("[VideoSense] 主动发送分析结果失败", exc_info=True)
+
+    # ------------------------------------------------------------------
     # 指令处理
     # ------------------------------------------------------------------
 
@@ -357,6 +389,18 @@ class VideoSensePlugin(Star):
         if not self._analysis_cfg.get("enable_llm_tool", True):
             return "视频分析功能未启用。"
 
+        umo = event.unified_msg_origin
+        self._run_background_analysis(umo, self._analyze_current_async(event, question))
+        return (
+            "⏳ 视频分析任务已提交，正在后台执行（视频分析可能需要数十秒）。"
+            "分析完成后插件会直接把结果发送给用户，"
+            "无需重复调用分析工具，等待结果即可。"
+        )
+
+    async def _analyze_current_async(
+        self, event: AstrMessageEvent, question: str
+    ) -> str:
+        """后台执行当前消息视频分析，返回要发送给用户的结果文本。"""
         client = self._make_client(question)
         try:
             result = await run_video_analysis(
@@ -368,14 +412,15 @@ class VideoSensePlugin(Star):
         finally:
             await client.close()
 
-        file_comp = extract_file_component(event)
-        if file_comp and not _is_error(result):
-            name = getattr(file_comp, "name", "") or ""
-            async with self._lock:
-                for item in self._registry.get(event.unified_msg_origin, []):
-                    if item["name"] == name and item["result"] is None:
-                        item["result"] = result
-                        break
+        if not _is_error(result):
+            file_comp = extract_file_component(event)
+            if file_comp:
+                name = video_component_name(file_comp)
+                async with self._lock:
+                    for item in self._registry.get(event.unified_msg_origin, []):
+                        if item["name"] == name and item["result"] is None:
+                            item["result"] = result
+                            break
         return result
 
     @llm_tool("list_video_files")
@@ -424,6 +469,15 @@ class VideoSensePlugin(Star):
         if item["result"]:
             return f"「{item['name']}」(已缓存结果) {item['result']}"
 
+        self._run_background_analysis(umo, self._analyze_number_async(umo, item))
+        return (
+            f"⏳ 已提交后台分析「{item['name']}」（视频分析可能需要数十秒）。"
+            "分析完成后插件会直接把结果发送给用户，"
+            "无需重复调用分析工具，等待结果即可。"
+        )
+
+    async def _analyze_number_async(self, umo: str, item: dict) -> str:
+        """后台执行按序号分析，返回要发送给用户的结果文本。"""
         try:
             resolved_path = await resolve_video_ref(item, self._max_size_mb)
         except VideoError as e:
@@ -434,12 +488,13 @@ class VideoSensePlugin(Star):
             result = await run_video_analysis_from_path(
                 resolved_path, self._max_size_mb, client
             )
-            if not _is_error(result):
-                async with self._lock:
-                    item["result"] = result
-            return f"「{item['name']}」{result}"
         finally:
             await client.close()
+
+        if not _is_error(result):
+            async with self._lock:
+                item["result"] = result
+        return f"「{item['name']}」{result}"
 
     # ------------------------------------------------------------------
     # 核心分析逻辑
@@ -470,6 +525,9 @@ class VideoSensePlugin(Star):
     # ------------------------------------------------------------------
 
     async def terminate(self) -> None:
+        for task in list(self._bg_tasks):
+            task.cancel()
+        self._bg_tasks.clear()
         self._registry.clear()
         logger.info("[VideoSense] 插件已卸载")
 

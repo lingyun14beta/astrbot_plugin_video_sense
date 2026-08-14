@@ -6,6 +6,7 @@ import importlib
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
+from unittest.mock import AsyncMock
 
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 
@@ -23,10 +24,24 @@ def _stub_astrbot():
     stub_modules["astrbot.api"].logger = SimpleNamespace(
         info=lambda *a, **k: None,
         warning=lambda *a, **k: None,
+        error=lambda *a, **k: None,
     )
     stub_modules["astrbot.api.event"].AstrMessageEvent = type(
         "AstrMessageEvent", (), {}
     )
+
+    class _MessageChainStub:
+        def __init__(self):
+            self._text = ""
+
+        def message(self, text):
+            self._text = str(text)
+            return self
+
+        def __str__(self):
+            return self._text
+
+    stub_modules["astrbot.api.event"].MessageChain = _MessageChainStub
 
     filter_mod = ModuleType("astrbot.api.event.filter")
     filter_mod.CustomFilter = type("CustomFilter", (), {})
@@ -36,7 +51,12 @@ def _stub_astrbot():
     sys.modules["astrbot.api.event.filter"] = filter_mod
 
     stub_modules["astrbot.api.star"].Context = type("Context", (), {})
-    stub_modules["astrbot.api.star"].Star = type("Star", (), {})
+
+    class _StarStub:
+        def __init__(self, context, config=None):
+            self.context = context
+
+    stub_modules["astrbot.api.star"].Star = _StarStub
 
 
 def _import_main():
@@ -85,3 +105,53 @@ class TestExtractExtra:
             _main._extract_extra("/分析视频   1   这个视频", "分析视频")
             == "1   这个视频"
         )
+
+
+class TestBackgroundAnalysis:
+    """LLM 工具后台分析：立即返回 + 结果主动发送 + 异常兜底。"""
+
+    def _make_plugin(self, send_side_effect=None):
+        send = AsyncMock(side_effect=send_side_effect)
+        context = SimpleNamespace(send_message=send)
+        plugin = _main.VideoSensePlugin(context=context, config={})
+        return plugin, send
+
+    async def test_result_sent_to_session(self):
+        plugin, send = self._make_plugin()
+
+        async def fake_coro():
+            return "分析结果"
+
+        plugin._run_background_analysis("umo1", fake_coro())
+        task = next(iter(plugin._bg_tasks))
+        await task
+
+        send.assert_awaited_once()
+        args = send.await_args
+        assert args.args[0] == "umo1"
+        assert "分析结果" in str(args.args[1])
+
+    async def test_exception_sends_failure_notice(self):
+        plugin, send = self._make_plugin()
+
+        async def broken_coro():
+            raise RuntimeError("API 爆炸")
+
+        plugin._run_background_analysis("umo1", broken_coro())
+        task = next(iter(plugin._bg_tasks))
+        await task
+
+        send.assert_awaited_once()
+        assert "视频分析失败" in str(send.await_args.args[1])
+
+    async def test_send_failure_does_not_crash(self):
+        plugin, send = self._make_plugin(send_side_effect=RuntimeError("平台不可达"))
+
+        async def fake_coro():
+            return "分析结果"
+
+        plugin._run_background_analysis("umo1", fake_coro())
+        task = next(iter(plugin._bg_tasks))
+        await task  # 不应抛出
+
+        send.assert_awaited_once()
