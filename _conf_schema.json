@@ -1,7 +1,7 @@
 {
   "api_provider": {
     "description": "视频分析 API",
-    "hint": "配置用于视频理解的 Gemini API 接入方式。可添加官方接口或 OpenAI 兼容中转站。",
+    "hint": "配置视频理解 API 接入方式：Gemini 官方接口，或 OpenAI 兼容中转站（支持 qwen-vl、gpt 等模型）。可添加多个接入方，在「分析设置 → 分析模型」中指定使用哪个。",
     "type": "template_list",
     "templates": {
       "official": {
@@ -76,7 +76,7 @@
           },
           "timeout": {
             "description": "超时时间（秒）",
-            "hint": "Gemini 处理视频通常需要 60-120 秒，建议不低于 180。",
+            "hint": "视频理解通常需要 60-120 秒，建议不低于 180。",
             "type": "int",
             "slider": { "min": 60, "max": 600, "step": 30 },
             "default": 180
@@ -98,13 +98,13 @@
       },
       "system_prompt": {
         "description": "分析系统提示词",
-        "hint": "发给 Gemini 的分析指令，告诉它如何描述视频。用于自动分析和 LLM 工具触发。",
+        "hint": "发给模型的分析指令，告诉它如何描述视频。指令触发和 LLM 工具触发时使用。",
         "type": "text",
         "default": "像一个朋友随便聊聊这段视频，突出你最想说的。不要列表。60字以内。"
       },
       "separate_prompts": {
         "description": "指令触发使用不同提示词",
-        "hint": "开启后，「/分析视频」指令触发时使用下方独立的提示词，自动分析和 LLM 工具仍使用上方提示词。",
+        "hint": "开启后，「/分析视频」指令触发时使用下方独立的提示词，LLM 工具触发仍使用上方提示词。",
         "type": "bool",
         "default": false
       },
@@ -120,13 +120,13 @@
       },
       "enable_llm_tool": {
         "description": "启用 LLM 工具调用",
-        "hint": "开启后 LLM 可在对话中主动调用视频分析工具，无需用户显式命令。",
+        "hint": "开启后，收到视频时插件会自动提示 LLM「对话中有视频可分析」，LLM 可主动调用分析工具，无需用户显式命令。",
         "type": "bool",
         "default": true
       },
       "debug": {
         "description": "调试模式",
-        "hint": "开启后，自动分析和缓存操作会在日志中输出详细信息，方便排查问题。",
+        "hint": "开启后，缓存、分析、提示注入等操作会在日志中输出详细信息，方便排查问题。",
         "type": "bool",
         "default": false
       },
@@ -139,7 +139,7 @@
       },
       "max_inline_size_mb": {
         "description": "内嵌传输上限（MB）",
-        "hint": "小于等于此大小的视频用内嵌传输（请求体含 base64 膨胀约 33%，官方总请求体上限 20MB）；超过则走 Files API。",
+        "hint": "小于等于此大小的视频用内嵌传输（请求体含 base64 膨胀约 33%，官方总请求体上限 20MB）；超过则走 Files API（官方）或自动压缩（中转站）。中转站遇 502 网关错误时可调低此值。",
         "type": "int",
         "slider": { "min": 1, "max": 19, "step": 1 },
         "default": 15,
@@ -147,7 +147,7 @@
       },
       "use_files_api": {
         "description": "启用 Files API（大视频上传）",
-        "hint": "超过内嵌上限的视频通过官方 Files API（resumable 上传）处理，免费层单文件 2GB。此开关仅对 Gemini 官方接口生效；中转站接入时会自动跳过 Files API（无论开关状态），改走自动压缩或报错提示，无需手动关闭。",
+        "hint": "超过内嵌上限的视频通过官方 Files API（resumable 上传）处理，免费层单文件 2GB，突破 20MB 请求体限制。此开关仅对 Gemini 官方接口生效；中转站接入时自动跳过（无论开关状态），改走自动压缩或报错提示，无需手动关闭。",
         "type": "bool",
         "default": true,
         "collapsed": true
