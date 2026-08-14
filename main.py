@@ -36,7 +36,14 @@ from .video_utils import (
 
 _DEFAULT_SYSTEM_PROMPT = (
     "你收到了一段视频。像朋友聊天一样描述这段视频：画面里发生了什么、"
-    "有什么值得注意的亮点、整体氛围如何。直接说重点，不要列表，60字以内。"
+    "有什么值得注意的亮点、整体氛围如何。直接说重点，不要列表，100字以内。"
+)
+
+_DEFAULT_COMMAND_SYSTEM_PROMPT = (
+    "你收到了一段视频。请像朋友聊天一样详细描述这段视频："
+    "画面里发生了什么、人物/场景/动作有哪些值得注意的细节、整体氛围如何。"
+    "如果用户带有追问，优先回答追问；没有追问就自然聊聊视频内容。"
+    "不要列表，200字以内。"
 )
 
 _ERROR_PREFIXES = ("文件处理失败", "视频分析失败")
@@ -173,7 +180,7 @@ class VideoSensePlugin(Star):
     @property
     def _command_system_prompt(self) -> str:
         return self._analysis_cfg.get(
-            "command_system_prompt", _DEFAULT_SYSTEM_PROMPT
+            "command_system_prompt", _DEFAULT_COMMAND_SYSTEM_PROMPT
         ).strip()
 
     def _resolve_provider_and_model(self) -> tuple[dict, str]:
