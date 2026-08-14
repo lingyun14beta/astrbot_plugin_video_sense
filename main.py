@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from pathlib import Path
 
 from astrbot.api import AstrBotConfig, llm_tool, logger
@@ -42,6 +43,28 @@ _ERROR_PREFIXES = ("文件处理失败", "视频分析失败")
 
 def _is_error(text: str) -> bool:
     return text.startswith(_ERROR_PREFIXES)
+
+
+def _format_relative_time(ts: float) -> str:
+    """将时间戳格式化为相对时间（刚刚/N分钟前/N小时前/N天前）。"""
+    diff = time.time() - ts
+    if diff < 60:
+        return "刚刚"
+    if diff < 3600:
+        return f"{int(diff / 60)}分钟前"
+    if diff < 86400:
+        return f"{int(diff / 3600)}小时前"
+    return f"{int(diff / 86400)}天前"
+
+
+def _format_video_list(items: list[dict]) -> str:
+    """格式化缓存视频列表（含相对接收时间），供 LLM 分辨新旧。"""
+    lines = []
+    for i, item in enumerate(items):
+        when = _format_relative_time(item.get("received_at", 0))
+        tag = " [已分析]" if item["result"] else ""
+        lines.append(f"{i + 1}. {item['name']}（{when}）{tag}")
+    return "\n".join(lines)
 
 
 class _FileComponentFilter(CustomFilter):
@@ -227,12 +250,19 @@ class VideoSensePlugin(Star):
             local, url = resolve_component_ref(comp)
             ref = local if (local and Path(local).is_file()) else (url or local)
             is_local = bool(local and Path(local).is_file())
-            # 去重：同名同引用的视频（如反复引用同一消息）只缓存一次
+            # 去重：同名同引用的视频（如反复引用同一消息）只缓存一次，但刷新接收时间
             for it in items:
                 if it["name"] == name and it["ref"] == ref:
+                    it["received_at"] = time.time()
                     return
             items.append(
-                {"name": name, "ref": ref, "is_local": is_local, "result": None}
+                {
+                    "name": name,
+                    "ref": ref,
+                    "is_local": is_local,
+                    "result": None,
+                    "received_at": time.time(),
+                }
             )
 
         new_hints = []
@@ -548,29 +578,18 @@ class VideoSensePlugin(Star):
 
         umo = event.unified_msg_origin
         if extract_file_component(event) is None:
-            # 当前消息没有携带视频：回退到会话缓存
+            # 当前消息没有携带视频：列出缓存（含时间），引导 LLM 按语境选序号
             async with self._lock:
                 items = list(self._registry.get(umo, []))
             if not items:
                 return (
                     "当前消息中没有视频文件，对话中也没有缓存视频，请让用户先发送视频。"
                 )
-            if len(items) == 1:
-                item = items[0]
-                if item["result"]:
-                    return f"「{item['name']}」(已缓存结果) {item['result']}"
-                self._run_background_analysis(
-                    umo, self._analyze_number_async(umo, item)
-                )
-                return (
-                    f"⏳ 已提交后台分析「{item['name']}」（视频分析可能需要数十秒）。"
-                    "分析完成后插件会直接把结果发送给用户，"
-                    "无需重复调用分析工具，等待结果即可。"
-                )
-            lines = [f"{i + 1}. {it['name']}" for i, it in enumerate(items)]
             return (
-                "当前消息没有附带视频。对话中有以下视频文件，"
-                "请调用 analyze_video_by_number 指定序号分析：\n" + "\n".join(lines)
+                "当前消息没有附带视频。对话中的视频文件（按接收时间）：\n"
+                + _format_video_list(items)
+                + "\n请根据用户语境判断指的是哪个，"
+                "调用 analyze_video_by_number 指定序号分析。"
             )
 
         self._run_background_analysis(umo, self._analyze_current_async(event, question))
@@ -619,11 +638,7 @@ class VideoSensePlugin(Star):
         if not items:
             return "对话中未收到过视频文件。"
 
-        lines = []
-        for i, item in enumerate(items):
-            tag = " [已分析]" if item["result"] else ""
-            lines.append(f"{i + 1}. {item['name']}{tag}")
-        return "对话中的视频文件：\n" + "\n".join(lines)
+        return "对话中的视频文件（按接收时间）：\n" + _format_video_list(items)
 
     @llm_tool("analyze_video_by_number")
     async def analyze_video_by_number(self, event: AstrMessageEvent, number: int):

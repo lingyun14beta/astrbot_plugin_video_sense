@@ -220,7 +220,7 @@ class TestVideoHintInjection:
 
 
 class TestAnalyzeCurrentVideoFallback:
-    """analyze_current_video 在消息无视频时回退缓存（单视频直接分析/多视频引导）。"""
+    """analyze_current_video 在消息无视频时列出缓存（含时间）并引导序号工具。"""
 
     def _make_plugin(self):
         plugin, _ = TestBackgroundAnalysis()._make_plugin()
@@ -238,38 +238,69 @@ class TestAnalyzeCurrentVideoFallback:
     async def test_no_video_no_cache_returns_guidance(self):
         plugin = self._make_plugin()
         result = await plugin.analyze_current_video(self._make_event())
-        assert "没有视频文件" in result or "先发送视频" in result
+        assert "先发送视频" in result
 
-    async def test_single_cached_video_auto_analyzes(self):
-        plugin = self._make_plugin()
-        plugin._registry["umo1"] = [
-            {"name": "clip.mp4", "ref": "/tmp/clip.mp4", "is_local": True, "result": None}
-        ]
-        result = await plugin.analyze_current_video(self._make_event())
-        assert "已提交后台分析" in result
-        assert "clip.mp4" in result
+    async def test_cached_videos_listed_with_time_and_guidance(self):
+        """不自动分析：列出缓存（含相对时间）并引导序号工具。"""
+        import time as _time
 
-    async def test_single_cached_video_with_result(self):
         plugin = self._make_plugin()
+        now = _time.time()
         plugin._registry["umo1"] = [
             {
-                "name": "clip.mp4",
-                "ref": "/tmp/clip.mp4",
+                "name": "a.mp4",
+                "ref": "/tmp/a.mp4",
                 "is_local": True,
-                "result": "这是一只猫",
-            }
-        ]
-        result = await plugin.analyze_current_video(self._make_event())
-        assert "已缓存结果" in result
-        assert "这是一只猫" in result
-
-    async def test_multiple_videos_guides_to_number_tool(self):
-        plugin = self._make_plugin()
-        plugin._registry["umo1"] = [
-            {"name": "a.mp4", "ref": "/tmp/a.mp4", "is_local": True, "result": None},
-            {"name": "b.mp4", "ref": "/tmp/b.mp4", "is_local": True, "result": None},
+                "result": None,
+                "received_at": now,
+            },
+            {
+                "name": "b.mp4",
+                "ref": "/tmp/b.mp4",
+                "is_local": True,
+                "result": None,
+                "received_at": now - 7200,
+            },
         ]
         result = await plugin.analyze_current_video(self._make_event())
         assert "analyze_video_by_number" in result
         assert "a.mp4" in result
         assert "b.mp4" in result
+        assert "刚刚" in result  # a.mp4 是刚刚
+        assert "2小时前" in result  # b.mp4 是 2 小时前
+
+
+class TestFormatVideoList:
+    def test_relative_time_formats(self):
+        import time as _time
+
+        now = _time.time()
+        assert _main._format_relative_time(now) == "刚刚"
+        assert _main._format_relative_time(now - 30) == "刚刚"
+        assert _main._format_relative_time(now - 300) == "5分钟前"
+        assert _main._format_relative_time(now - 7200) == "2小时前"
+        assert _main._format_relative_time(now - 172800) == "2天前"
+
+    def test_video_list_with_time_and_tag(self):
+        import time as _time
+
+        now = _time.time()
+        items = [
+            {
+                "name": "a.mp4",
+                "ref": "/tmp/a.mp4",
+                "is_local": True,
+                "result": "已分析结果",
+                "received_at": now,
+            },
+            {
+                "name": "b.mp4",
+                "ref": "/tmp/b.mp4",
+                "is_local": True,
+                "result": None,
+                "received_at": now - 3600,
+            },
+        ]
+        text = _main._format_video_list(items)
+        assert "1. a.mp4（刚刚） [已分析]" in text
+        assert "2. b.mp4（1小时前）" in text
