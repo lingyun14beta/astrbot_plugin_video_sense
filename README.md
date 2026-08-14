@@ -147,3 +147,7 @@ python -m pytest tests -v
 ```
 
 > 压缩功能真实联调需要 ffmpeg：`pip install imageio-ffmpeg`（仅测试环境安装，插件不声明该依赖）。
+
+---
+
+![Moe Counter](https://count.getloli.com/get/@lingyun14beta-video_sense?theme=miku)
