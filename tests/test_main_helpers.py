@@ -217,3 +217,59 @@ class TestVideoHintInjection:
         event = SimpleNamespace(unified_msg_origin="umo1")
         await plugin._on_llm_request(event, req)
         assert req.contexts == []
+
+
+class TestAnalyzeCurrentVideoFallback:
+    """analyze_current_video 在消息无视频时回退缓存（单视频直接分析/多视频引导）。"""
+
+    def _make_plugin(self):
+        plugin, _ = TestBackgroundAnalysis()._make_plugin()
+        return plugin
+
+    def _make_event(self, umo="umo1"):
+        # 空消息链：get_messages 返回 []，extract_file_component 找不到视频
+        return SimpleNamespace(
+            unified_msg_origin=umo,
+            get_messages=lambda: [],
+            message_obj=SimpleNamespace(message=[]),
+            message_str="",
+        )
+
+    async def test_no_video_no_cache_returns_guidance(self):
+        plugin = self._make_plugin()
+        result = await plugin.analyze_current_video(self._make_event())
+        assert "没有视频文件" in result or "先发送视频" in result
+
+    async def test_single_cached_video_auto_analyzes(self):
+        plugin = self._make_plugin()
+        plugin._registry["umo1"] = [
+            {"name": "clip.mp4", "ref": "/tmp/clip.mp4", "is_local": True, "result": None}
+        ]
+        result = await plugin.analyze_current_video(self._make_event())
+        assert "已提交后台分析" in result
+        assert "clip.mp4" in result
+
+    async def test_single_cached_video_with_result(self):
+        plugin = self._make_plugin()
+        plugin._registry["umo1"] = [
+            {
+                "name": "clip.mp4",
+                "ref": "/tmp/clip.mp4",
+                "is_local": True,
+                "result": "这是一只猫",
+            }
+        ]
+        result = await plugin.analyze_current_video(self._make_event())
+        assert "已缓存结果" in result
+        assert "这是一只猫" in result
+
+    async def test_multiple_videos_guides_to_number_tool(self):
+        plugin = self._make_plugin()
+        plugin._registry["umo1"] = [
+            {"name": "a.mp4", "ref": "/tmp/a.mp4", "is_local": True, "result": None},
+            {"name": "b.mp4", "ref": "/tmp/b.mp4", "is_local": True, "result": None},
+        ]
+        result = await plugin.analyze_current_video(self._make_event())
+        assert "analyze_video_by_number" in result
+        assert "a.mp4" in result
+        assert "b.mp4" in result

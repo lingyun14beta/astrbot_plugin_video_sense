@@ -535,8 +535,10 @@ class VideoSensePlugin(Star):
 
     @llm_tool("analyze_current_video")
     async def analyze_current_video(self, event: AstrMessageEvent, question: str = ""):
-        """分析当前消息或引用消息中的视频文件。
-        当用户直接发送了视频、引用含视频的消息，或询问视频内容时调用。
+        """分析本条消息中直接携带的视频文件（用户刚刚随消息发送的，或引用消息中的视频）。
+        仅当本条消息（或引用的消息）确实带有视频时调用本工具。
+        如果用户提到的视频不是本条消息附带的（是之前发过的），不要调用本工具，
+        请先调用 list_video_files 查看对话中的视频列表，再用 analyze_video_by_number 按序号分析。
 
         Args:
             question(str, optional): 用户对视频的具体追问，如"这个视频在干嘛？"
@@ -545,6 +547,32 @@ class VideoSensePlugin(Star):
             return "视频分析功能未启用。"
 
         umo = event.unified_msg_origin
+        if extract_file_component(event) is None:
+            # 当前消息没有携带视频：回退到会话缓存
+            async with self._lock:
+                items = list(self._registry.get(umo, []))
+            if not items:
+                return (
+                    "当前消息中没有视频文件，对话中也没有缓存视频，请让用户先发送视频。"
+                )
+            if len(items) == 1:
+                item = items[0]
+                if item["result"]:
+                    return f"「{item['name']}」(已缓存结果) {item['result']}"
+                self._run_background_analysis(
+                    umo, self._analyze_number_async(umo, item)
+                )
+                return (
+                    f"⏳ 已提交后台分析「{item['name']}」（视频分析可能需要数十秒）。"
+                    "分析完成后插件会直接把结果发送给用户，"
+                    "无需重复调用分析工具，等待结果即可。"
+                )
+            lines = [f"{i + 1}. {it['name']}" for i, it in enumerate(items)]
+            return (
+                "当前消息没有附带视频。对话中有以下视频文件，"
+                "请调用 analyze_video_by_number 指定序号分析：\n" + "\n".join(lines)
+            )
+
         self._run_background_analysis(umo, self._analyze_current_async(event, question))
         return (
             "⏳ 视频分析任务已提交，正在后台执行（视频分析可能需要数十秒）。"
@@ -581,8 +609,8 @@ class VideoSensePlugin(Star):
     @llm_tool("list_video_files")
     async def list_video_files(self, event: AstrMessageEvent):
         """列出当前对话中出现过的所有视频文件及其序号。
-        当用户提到视频、询问对话中的视频，或用户发过视频但未指定具体哪个时调用。
-        调用后再用 analyze_video_by_number 分析指定视频。
+        当用户提到之前发过的视频、询问对话中有哪些视频，
+        或需要按序号分析历史视频时调用。调用后再用 analyze_video_by_number 分析指定视频。
         """
         umo = event.unified_msg_origin
         async with self._lock:
@@ -599,7 +627,8 @@ class VideoSensePlugin(Star):
 
     @llm_tool("analyze_video_by_number")
     async def analyze_video_by_number(self, event: AstrMessageEvent, number: int):
-        """分析对话中指定序号的视频文件。需先调用 list_video_files 获取序号。
+        """分析对话中指定序号的视频文件（适用于之前发过、本条消息未附带的视频）。
+        先调用 list_video_files 获取序号，再调用本工具。
 
         Args:
             number(int): 视频文件序号，从 list_video_files 返回的列表中选择
