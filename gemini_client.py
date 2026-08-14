@@ -555,6 +555,15 @@ def _parse_openai_response(raw: str) -> str:
 
 
 def _extract_error_message(raw: str) -> str:
+    if not raw:
+        return ""
+    if raw.lstrip().startswith("<"):
+        # 网关返回 HTML 错误页（nginx/反代），常见于请求体过大或上游错误
+        return (
+            "网关返回 HTML 错误页（可能为反向代理限制请求大小，"
+            "或上游服务错误）。可尝试降低「内嵌传输上限」并开启「自动压缩」"
+            "以减小请求体。"
+        )
     try:
         data = json.loads(raw)
         if isinstance(data, dict):
@@ -564,7 +573,7 @@ def _extract_error_message(raw: str) -> str:
             return str(err)
     except Exception:
         pass
-    return raw[:200] if raw else ""
+    return raw[:200]
 
 
 def _is_retryable_error(message: str) -> bool:

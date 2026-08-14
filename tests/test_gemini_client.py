@@ -345,6 +345,26 @@ class TestIsRetryableError:
         assert _is_retryable_error("Invalid API key") is False
 
 
+class TestExtractErrorMessage:
+    def test_html_gateway_error(self):
+        from gemini_client import _extract_error_message
+
+        msg = _extract_error_message("<!DOCTYPE html><html>502 Bad Gateway</html>")
+        assert "HTML 错误页" in msg
+        assert "自动压缩" in msg
+
+    def test_json_error(self):
+        from gemini_client import _extract_error_message
+
+        msg = _extract_error_message('{"error": {"message": "rate limit"}}')
+        assert msg == "rate limit"
+
+    def test_empty(self):
+        from gemini_client import _extract_error_message
+
+        assert _extract_error_message("") == ""
+
+
 class TestAnalyzeWithoutApiKey:
     async def test_empty_api_key(self, sample_video_base64):
         client = GeminiClient(
