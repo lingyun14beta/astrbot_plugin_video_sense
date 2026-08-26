@@ -670,6 +670,363 @@ class TestAnalyzeVideo:
         assert "inline_data" in sent["payload"]["contents"][0]["parts"][0]
 
 
+    async def test_kimi_video_uploads_and_uses_ms_ref(self, tmp_path):
+        """kimi 模型：视频上传后以 ms:// 引用，走 chat/completions。"""
+        client = GeminiClient(
+            api_key="k",
+            model="kimi-k3",
+            system_prompt="s",
+            base_url="https://api.moonshot.cn/v1",
+        )
+        video = self._make_video(1024, tmp_path)
+        sent = {}
+
+        async def fake_post(url, headers, payload):
+            sent["url"] = url
+            sent["payload"] = payload
+            return "分析结果"
+
+        client._post = fake_post
+        with patch(
+            "gemini_client.upload_video_file",
+            new=AsyncMock(return_value="ms://file-abc"),
+        ) as upload:
+            result = await client.analyze_video(video)
+        assert result == "分析结果"
+        upload.assert_awaited_once()
+        assert sent["url"] == "https://api.moonshot.cn/v1/chat/completions"
+        video_part = sent["payload"]["messages"][1]["content"][1]
+        assert video_part["type"] == "video_url"
+        assert video_part["video_url"]["url"] == "ms://file-abc"
+
+    async def test_kimi_large_video_still_uploads(self, tmp_path):
+        """kimi 模型大视频：不依赖内嵌上限，直接上传。"""
+        client = GeminiClient(
+            api_key="k",
+            model="kimi-k3",
+            system_prompt="s",
+            base_url="https://api.moonshot.cn/v1",
+            max_inline_size_mb=1,
+        )
+        video = self._make_video(2 * 1024 * 1024, tmp_path)
+        client._request_text = AsyncMock(return_value="结果")
+        with patch(
+            "gemini_client.upload_video_file",
+            new=AsyncMock(return_value="ms://file-big"),
+        ) as upload:
+            result = await client.analyze_video(video)
+        assert result == "结果"
+        upload.assert_awaited_once()
+
+    async def test_kimi_upload_error_wrapped(self, tmp_path):
+        """上传失败以 GeminiClientError 抛出（main.py 统一捕获）。"""
+        from kimi_uploader import KimiUploadError
+
+        client = GeminiClient(
+            api_key="k",
+            model="kimi-k3",
+            system_prompt="s",
+            base_url="https://api.moonshot.cn/v1",
+        )
+        video = self._make_video(1024, tmp_path)
+
+        async def raise_error(**kwargs):
+            raise KimiUploadError("上传失败：boom")
+
+        with patch("gemini_client.upload_video_file", new=raise_error):
+            with pytest.raises(GeminiClientError, match="上传失败：boom"):
+                await client.analyze_video(video)
+
+
+class TestIsKimi:
+    def test_kimi_model(self):
+        client = GeminiClient(
+            api_key="k",
+            model="kimi-k3",
+            system_prompt="s",
+            base_url="https://api.moonshot.cn/v1",
+        )
+        assert client._is_kimi() is True
+
+    def test_non_kimi_model(self):
+        client = GeminiClient(
+            api_key="k",
+            model="qwen-vl-max",
+            system_prompt="s",
+            base_url="https://proxy.example.com/v1",
+        )
+        assert client._is_kimi() is False
+
+
+class TestBuildKimiPayload:
+    def test_payload_structure(self):
+        client = GeminiClient(
+            api_key="k",
+            model="kimi-k3",
+            system_prompt="分析这段视频。",
+            base_url="https://api.moonshot.cn/v1",
+        )
+        payload = client._build_kimi_payload("ms://file-abc")
+        assert payload["model"] == "kimi-k3"
+        assert payload["messages"][0] == {
+            "role": "system",
+            "content": "分析这段视频。",
+        }
+        user_content = payload["messages"][1]["content"]
+        assert isinstance(user_content, list)
+        assert user_content[0] == {"type": "text", "text": "请分析这段视频。"}
+        video_part = user_content[1]
+        assert video_part["type"] == "video_url"
+        assert video_part["video_url"] == {"url": "ms://file-abc"}
+
+
+class TestAnalyzeVideoQwen:
+    """百炼 qwen 视频分析链路（自带 _make_video 构造器）。"""
+
+    @staticmethod
+    def _make_video(size_bytes, tmp_path, name="clip.mp4"):
+        p = tmp_path / name
+        p.write_bytes(b"\x00" * size_bytes)
+        return type(
+            "Video",
+            (),
+            {
+                "path": str(p),
+                "mime_type": "video/mp4",
+                "filename": name,
+                "size_bytes": size_bytes,
+            },
+        )()
+
+    async def test_qwen_small_video_inline_on_dashscope(self, tmp_path):
+        """百炼直连 qwen 小视频：base64 内嵌，不触发临时 URL 上传。"""
+        client = GeminiClient(
+            api_key="k",
+            model="qwen-vl-max",
+            system_prompt="s",
+            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        )
+        video = self._make_video(1024, tmp_path)
+        sent = {}
+
+        async def fake_post(url, headers, payload):
+            sent["url"] = url
+            sent["payload"] = payload
+            return "分析结果"
+
+        client._post = fake_post
+        with patch(
+            "gemini_client.upload_video_to_temp_url",
+            new=AsyncMock(return_value="oss://upload/1/clip.mp4"),
+        ) as upload:
+            result = await client.analyze_video(video)
+        assert result == "分析结果"
+        upload.assert_not_awaited()
+        assert sent["url"] == (
+            "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+        )
+        video_part = sent["payload"]["messages"][1]["content"][1]
+        assert video_part["video_url"]["url"].startswith("data:video/mp4;base64,")
+        assert "fps" not in video_part
+
+    async def test_qwen_large_video_uses_temp_url(self, tmp_path):
+        """百炼直连 qwen 大视频：走临时 URL 上传（oss:// 引用）。"""
+        client = GeminiClient(
+            api_key="k",
+            model="qwen-vl-max",
+            system_prompt="s",
+            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        )
+        video = self._make_video(8 * 1024 * 1024, tmp_path)
+        sent = {}
+
+        async def fake_post(url, headers, payload):
+            sent["url"] = url
+            sent["headers"] = headers
+            sent["payload"] = payload
+            return "临时 URL 分析结果"
+
+        client._post = fake_post
+        with patch(
+            "gemini_client.upload_video_to_temp_url",
+            new=AsyncMock(return_value="oss://upload/2024/12/01/clip.mp4"),
+        ) as upload:
+            result = await client.analyze_video(video)
+        assert result == "临时 URL 分析结果"
+        upload.assert_awaited_once()
+        kwargs = upload.await_args.kwargs
+        assert kwargs["model"] == "qwen-vl-max"
+        assert kwargs["base_url"] == "https://dashscope.aliyuncs.com/compatible-mode/v1"
+        # 官方要求：oss:// 引用必须携带资源解析头
+        assert sent["headers"]["X-DashScope-OssResourceResolve"] == "enable"
+        video_part = sent["payload"]["messages"][1]["content"][1]
+        assert video_part["video_url"]["url"] == "oss://upload/2024/12/01/clip.mp4"
+
+    async def test_qwen_large_video_on_relay_falls_back(self, tmp_path):
+        """中转站 qwen 大视频：不是百炼直连，走原压缩/报错路径（不上传临时 URL）。"""
+        client = GeminiClient(
+            api_key="k",
+            model="qwen-vl-max",
+            system_prompt="s",
+            base_url="https://proxy.example.com/v1",
+            max_inline_size_mb=1,
+        )
+        video = self._make_video(2 * 1024 * 1024, tmp_path)
+        with patch(
+            "gemini_client.upload_video_to_temp_url", new=AsyncMock()
+        ) as upload:
+            with pytest.raises(GeminiClientError, match="自动压缩"):
+                await client.analyze_video(video)
+        upload.assert_not_awaited()
+
+    async def test_qwen_temp_url_error_wrapped(self, tmp_path):
+        """临时 URL 上传失败以 GeminiClientError 抛出（main.py 统一捕获）。"""
+        from qwen_uploader import QwenUploadError
+
+        client = GeminiClient(
+            api_key="k",
+            model="qwen-vl-max",
+            system_prompt="s",
+            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        )
+        video = self._make_video(8 * 1024 * 1024, tmp_path)
+
+        async def raise_error(**kwargs):
+            raise QwenUploadError("上传失败：boom")
+
+        with patch("gemini_client.upload_video_to_temp_url", new=raise_error):
+            with pytest.raises(GeminiClientError, match="上传失败：boom"):
+                await client.analyze_video(video)
+
+    async def test_qwen_boundary_74mb_inline(self, tmp_path):
+        """百炼 base64 上限边界：7.4MB 原始视频仍走内嵌（编码后 < 10MB）。"""
+        from gemini_client import _QWEN_BASE64_RAW_BYTES
+
+        client = GeminiClient(
+            api_key="k",
+            model="qwen-vl-max",
+            system_prompt="s",
+            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        )
+        video = self._make_video(_QWEN_BASE64_RAW_BYTES, tmp_path)
+        sent = {}
+
+        async def fake_post(url, headers, payload):
+            sent["payload"] = payload
+            return "分析结果"
+
+        client._post = fake_post
+        with patch(
+            "gemini_client.upload_video_to_temp_url", new=AsyncMock()
+        ) as upload:
+            await client.analyze_video(video)
+        upload.assert_not_awaited()
+        video_part = sent["payload"]["messages"][1]["content"][1]
+        assert video_part["video_url"]["url"].startswith("data:video/mp4;base64,")
+
+    async def test_qwen_boundary_76mb_uploads(self, tmp_path):
+        """百炼 base64 上限边界：超过 7.4MB 走临时 URL 上传。"""
+        from gemini_client import _QWEN_BASE64_RAW_BYTES
+
+        client = GeminiClient(
+            api_key="k",
+            model="qwen-vl-max",
+            system_prompt="s",
+            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        )
+        video = self._make_video(_QWEN_BASE64_RAW_BYTES + 204800, tmp_path)
+        client._request_text = AsyncMock(return_value="结果")
+        with patch(
+            "gemini_client.upload_video_to_temp_url",
+            new=AsyncMock(return_value="oss://upload/1/clip.mp4"),
+        ) as upload:
+            result = await client.analyze_video(video)
+        assert result == "结果"
+        upload.assert_awaited_once()
+
+    async def test_qwen_fps_included_in_payload(self, tmp_path):
+        """配置了 fps 时，video_url 部分携带 fps 参数。"""
+        client = GeminiClient(
+            api_key="k",
+            model="qwen-vl-max",
+            system_prompt="s",
+            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+            fps=1.5,
+        )
+        video = self._make_video(1024, tmp_path)
+        sent = {}
+
+        async def fake_post(url, headers, payload):
+            sent["payload"] = payload
+            return "分析结果"
+
+        client._post = fake_post
+        await client.analyze_video(video)
+        video_part = sent["payload"]["messages"][1]["content"][1]
+        assert video_part["fps"] == 1.5
+
+
+class TestQwenDetection:
+    def test_is_qwen(self):
+        client = GeminiClient(
+            api_key="k",
+            model="qwen-vl-max",
+            system_prompt="s",
+            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        )
+        assert client._is_qwen() is True
+
+    def test_not_qwen(self):
+        client = GeminiClient(
+            api_key="k",
+            model="kimi-k3",
+            system_prompt="s",
+            base_url="https://api.moonshot.cn/v1",
+        )
+        assert client._is_qwen() is False
+
+    def test_is_dashscope_public(self):
+        client = GeminiClient(
+            api_key="k",
+            model="qwen-vl-max",
+            system_prompt="s",
+            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        )
+        assert client._is_dashscope() is True
+
+    def test_is_dashscope_workspace(self):
+        client = GeminiClient(
+            api_key="k",
+            model="qwen-vl-max",
+            system_prompt="s",
+            base_url="https://ws-123.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+        )
+        assert client._is_dashscope() is True
+
+    def test_not_dashscope(self):
+        client = GeminiClient(
+            api_key="k",
+            model="qwen-vl-max",
+            system_prompt="s",
+            base_url="https://proxy.example.com/v1",
+        )
+        assert client._is_dashscope() is False
+
+
+class TestBuildOpenAiPayloadFps:
+    def test_fps_included(self, sample_video_base64):
+        client = GeminiClient(api_key="k", model="qwen-vl-max", system_prompt="s")
+        payload = client._build_openai_payload(sample_video_base64, "video/mp4", fps=2.0)
+        video_part = payload["messages"][1]["content"][1]
+        assert video_part["fps"] == 2.0
+
+    def test_fps_omitted_when_zero(self, sample_video_base64):
+        client = GeminiClient(api_key="k", model="qwen-vl-max", system_prompt="s")
+        payload = client._build_openai_payload(sample_video_base64, "video/mp4")
+        video_part = payload["messages"][1]["content"][1]
+        assert "fps" not in video_part
+
+
 class TestUploadFile:
     def _client(self):
         return GeminiClient(api_key="k", model="m", system_prompt="s")

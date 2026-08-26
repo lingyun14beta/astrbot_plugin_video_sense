@@ -82,6 +82,104 @@
             "default": 180
           }
         }
+      },
+      "qwen": {
+        "name": "通义千问（阿里云百炼）",
+        "hint": "使用阿里云百炼 DashScope 的 OpenAI 兼容接口。小视频 base64 内嵌；大视频自动走免费临时 URL 上传（oss://，48 小时有效，单文件 ≤1GB）。",
+        "display_item": "name",
+        "hide_hint_in_list": true,
+        "items": {
+          "name": {
+            "description": "供应商名称",
+            "hint": "用于标识此接入方，格式：供应商名称/模型名称。",
+            "type": "string",
+            "default": "qwen"
+          },
+          "api_key": {
+            "description": "API Key",
+            "hint": "填写阿里云百炼 DashScope 的 API Key。",
+            "type": "string",
+            "default": ""
+          },
+          "base_url": {
+            "description": "Base URL",
+            "hint": "DashScope OpenAI 兼容接口地址。可迁移至业务空间专属域名 https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/compatible-mode/v1（性能更优）；大视频临时 URL 上传在专属域名下需先验证是否可用。",
+            "type": "string",
+            "default": "https://dashscope.aliyuncs.com/compatible-mode/v1"
+          },
+          "model": {
+            "description": "模型名称",
+            "hint": "视频理解推荐 qwen3.7-plus（2 小时/2GB）；低成本可选 qwen3.7-flash。旧模型 qwen-vl-max 仅支持 20 分钟视频。",
+            "type": "string",
+            "default": "qwen-vl-max"
+          },
+          "fps": {
+            "description": "抽帧频率（可选）",
+            "hint": "每秒抽帧数 [0.1, 10]，默认 2.0。高速运动场景调高，长视频调低。",
+            "type": "float",
+            "default": 2.0
+          },
+          "protocol": {
+            "description": "协议（可选）",
+            "hint": "留空自动判断：模型名含 gemini 走 Gemini 协议，否则走 OpenAI 兼容协议。可强制指定 gemini 或 openai。",
+            "type": "string",
+            "default": "",
+            "collapsed": true
+          },
+          "timeout": {
+            "description": "超时时间（秒）",
+            "hint": "视频理解通常需要 60-120 秒，建议不低于 180。",
+            "type": "int",
+            "slider": { "min": 60, "max": 600, "step": 30 },
+            "default": 180
+          }
+        }
+      },
+      "kimi": {
+        "name": "Kimi（Moonshot）",
+        "hint": "使用 Moonshot Kimi 的 OpenAI 兼容接口。视频自动走 /v1/files 上传后以 ms:// 引用（官方唯一视频接入方式），单文件上限 100MB。",
+        "display_item": "name",
+        "hide_hint_in_list": true,
+        "items": {
+          "name": {
+            "description": "供应商名称",
+            "hint": "用于标识此接入方，格式：供应商名称/模型名称。",
+            "type": "string",
+            "default": "kimi"
+          },
+          "api_key": {
+            "description": "API Key",
+            "hint": "填写 Moonshot 平台的 API Key。",
+            "type": "string",
+            "default": ""
+          },
+          "base_url": {
+            "description": "Base URL",
+            "hint": "Moonshot Kimi 的 OpenAI 兼容接口地址。",
+            "type": "string",
+            "default": "https://api.moonshot.cn/v1"
+          },
+          "model": {
+            "description": "模型名称",
+            "hint": "视频理解推荐 kimi-k3；kimi-k2.6 / kimi-k2.7-code / kimi-k2.7-code-highspeed 亦可。moonshot-v1-*-vision-preview 系列仅支持图片。",
+            "type": "string",
+            "default": "kimi-k3"
+          },
+          "protocol": {
+            "description": "协议（可选）",
+            "hint": "留空自动判断：模型名含 gemini 走 Gemini 协议，否则走 OpenAI 兼容协议。可强制指定 gemini 或 openai。",
+            "type": "string",
+            "default": "",
+            "collapsed": true
+          },
+          "timeout": {
+            "description": "超时时间（秒）",
+            "hint": "视频理解通常需要 60-120 秒，建议不低于 180。",
+            "type": "int",
+            "slider": { "min": 60, "max": 600, "step": 30 },
+            "default": 180
+          }
+        }
       }
     }
   },

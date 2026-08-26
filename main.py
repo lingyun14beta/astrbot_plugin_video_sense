@@ -218,6 +218,10 @@ class VideoSensePlugin(Star):
             sp = self._system_prompt
         if extra_prompt:
             sp = f"{sp}\n\n用户的追加问题：{extra_prompt}"
+        try:
+            fps = float(provider.get("fps") or 0)
+        except (TypeError, ValueError):
+            fps = 0.0
         return GeminiClient(
             api_key=provider.get("api_key", ""),
             model=model,
@@ -227,6 +231,7 @@ class VideoSensePlugin(Star):
             max_inline_size_mb=self._max_inline_mb,
             use_files_api=self._use_files_api,
             protocol=str(provider.get("protocol", "auto") or "auto"),
+            fps=fps,
             compress=self._auto_compress,
             compress_max_duration=self._compress_max_duration,
             compress_resolution=self._compress_resolution,

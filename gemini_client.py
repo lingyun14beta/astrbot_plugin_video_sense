@@ -8,6 +8,13 @@
 - 内嵌传输（inline_data / video_url data URL）：文件 ≤ max_inline_size_mb。
 - Files API（官方推荐，免费层 2GB）：仅 Gemini 官方接口 + 大文件时使用。
   参考：https://ai.google.dev/gemini-api/docs/files
+- Kimi（模型名含 "kimi"）：视频必须经 /v1/files（purpose=video）上传，
+  再用 ms://<file-id> 引用，实现见 kimi_uploader.py。
+  参考：https://platform.kimi.com/docs/guide/use-kimi-vision-model
+- 百炼 qwen（模型名含 "qwen" 且直连百炼）：小视频 base64 内嵌（官方上限约
+  7.5MB），大视频走免费临时 URL 上传（oss://，48 小时有效，≤1GB），
+  实现见 qwen_uploader.py。
+  参考：https://help.aliyun.com/zh/model-studio/get-temporary-file-url
 """
 
 from __future__ import annotations
@@ -26,6 +33,16 @@ try:
 except ImportError:  # 非包上下文（测试直接导入模块）
     from ffmpeg_utils import FfmpegError, compress_video, find_ffmpeg
 
+try:
+    from .kimi_uploader import KimiUploadError, upload_video_file
+except ImportError:  # 非包上下文（测试直接导入模块）
+    from kimi_uploader import KimiUploadError, upload_video_file
+
+try:
+    from .qwen_uploader import QwenUploadError, upload_video_to_temp_url
+except ImportError:  # 非包上下文（测试直接导入模块）
+    from qwen_uploader import QwenUploadError, upload_video_to_temp_url
+
 _OFFICIAL_HOSTS: frozenset[str] = frozenset(
     {
         "generativelanguage.googleapis.com",
@@ -43,6 +60,15 @@ _HTTP_5XX_MIN = 500
 
 _FILE_STATE_ACTIVE = "ACTIVE"
 _FILE_STATE_FAILED = "FAILED"
+
+# 百炼官方限制：Base64 编码后的视频字符串 < 10MB（严格小于）。
+# 7.4MB 原始视频编码后约 9.87MB（含 data URL 前缀仍 < 10MB）；7.5MB 会恰好等于 10MB。
+_QWEN_BASE64_RAW_BYTES = int(7.4 * _MB)
+
+# 百炼官方要求：使用 oss:// 临时 URL 调用时必须添加此请求头，否则接口报错。
+# 参考：https://help.aliyun.com/zh/model-studio/get-temporary-file-url
+_OSS_RESOLVE_HEADER = "X-DashScope-OssResourceResolve"
+_OSS_RESOLVE_VALUE = "enable"
 
 _PROTOCOL_AUTO = "auto"
 _PROTOCOL_GEMINI = "gemini"
@@ -71,6 +97,7 @@ class GeminiClient:
         max_inline_size_mb: int = 15,
         use_files_api: bool = True,
         protocol: str = _PROTOCOL_AUTO,
+        fps: float = 0.0,
         compress: bool = False,
         compress_max_duration: int = 120,
         compress_resolution: int = 720,
@@ -85,6 +112,10 @@ class GeminiClient:
         self._max_inline_size_mb = max(0, int(max_inline_size_mb))
         self._use_files_api = bool(use_files_api)
         self._protocol = (protocol or _PROTOCOL_AUTO).strip().lower()
+        try:
+            self._fps = float(fps) if fps else 0.0
+        except (TypeError, ValueError):
+            self._fps = 0.0
         self._compress = bool(compress)
         self._compress_max_duration = max(0, int(compress_max_duration))
         self._compress_resolution = max(0, int(compress_resolution))
@@ -104,6 +135,12 @@ class GeminiClient:
         Raises:
             GeminiClientError: 调用失败或返回为空。
         """
+        # 百炼 qwen：小视频 base64 内嵌（官方上限 10MB 字符串），大视频走临时 URL
+        if not self._is_gemini_protocol() and self._is_qwen() and self._is_dashscope():
+            return await self._analyze_qwen(video)
+        # Kimi：视频只能经文件上传 + ms:// 引用（不区分大小，见 kimi_uploader.py）
+        if not self._is_gemini_protocol() and self._is_kimi():
+            return await self._analyze_kimi(video)
         inline_limit = self._max_inline_size_mb * _MB
         if video.size_bytes <= inline_limit:
             return await self.analyze(
@@ -293,6 +330,100 @@ class GeminiClient:
             if compressed is not None:
                 await asyncio.to_thread(Path(compressed.path).unlink, missing_ok=True)
 
+    async def _analyze_qwen(self, video) -> str:
+        """百炼 qwen 视频分析：小视频 base64 内嵌，大视频走免费临时 URL 上传。
+
+        Args:
+            video: 具有 path / mime_type / filename / size_bytes 属性的对象。
+
+        Returns:
+            视频分析结果文本。
+
+        Raises:
+            GeminiClientError: 上传或分析失败。
+        """
+        inline_limit = min(self._max_inline_size_mb * _MB, _QWEN_BASE64_RAW_BYTES)
+        headers = self._build_headers()
+        if video.size_bytes <= inline_limit:
+            b64 = await self._read_base64(video.path)
+            payload = self._build_openai_payload(b64, video.mime_type, fps=self._fps)
+        else:
+            try:
+                file_ref = await upload_video_to_temp_url(
+                    api_key=self._api_key,
+                    base_url=self._base_url,
+                    model=self._model,
+                    file_path=video.path,
+                    mime_type=video.mime_type,
+                    filename=getattr(video, "filename", "") or Path(video.path).name,
+                    timeout=self._timeout,
+                )
+            except QwenUploadError as e:
+                raise GeminiClientError(str(e)) from e
+            payload = self._build_openai_payload_url(file_ref, fps=self._fps)
+            # 官方要求：使用 oss:// 临时 URL 调用时必须显式声明资源解析
+            headers = {**headers, _OSS_RESOLVE_HEADER: _OSS_RESOLVE_VALUE}
+        return await self._request_text(
+            self._build_url(),
+            headers,
+            payload,
+        )
+
+    async def _analyze_kimi(self, video) -> str:
+        """Kimi 视频分析：上传文件（purpose=video）后用 ms:// 引用。
+
+        Args:
+            video: 具有 path / mime_type / filename 属性的对象。
+
+        Returns:
+            视频分析结果文本。
+
+        Raises:
+            GeminiClientError: 上传或分析失败。
+        """
+        try:
+            file_ref = await upload_video_file(
+                api_key=self._api_key,
+                base_url=self._base_url,
+                file_path=video.path,
+                mime_type=video.mime_type,
+                filename=getattr(video, "filename", "") or Path(video.path).name,
+                timeout=self._timeout,
+            )
+        except KimiUploadError as e:
+            raise GeminiClientError(str(e)) from e
+        return await self._request_text(
+            self._build_url(),
+            self._build_headers(),
+            self._build_kimi_payload(file_ref),
+        )
+
+    def _build_kimi_payload(self, file_ref: str) -> dict:
+        """Kimi 请求体：视频通过 ms:// 文件 ID 引用（官方唯一视频接入方式）。
+
+        Args:
+            file_ref: ms://<file-id> 形式的文件引用。
+
+        Returns:
+            OpenAI 兼容协议请求体（content 为多模态 part 数组）。
+        """
+        return {
+            "model": self._model,
+            "messages": [
+                {"role": "system", "content": self._system_prompt},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "请分析这段视频。"},
+                        {
+                            "type": "video_url",
+                            "video_url": {"url": file_ref},
+                        },
+                    ],
+                },
+            ],
+        }
+
     async def _request_text(self, url: str, headers: dict, payload: dict) -> str:
         last_error: str = "未知错误"
         for attempt in range(self._retry_times + 1):
@@ -349,6 +480,24 @@ class GeminiClient:
             return host in _OFFICIAL_HOSTS
         except Exception:
             return False
+
+    def _is_kimi(self) -> bool:
+        """按模型名判断是否为 Kimi（Moonshot）：视频走上传 + ms:// 引用。"""
+        return "kimi" in self._model.lower()
+
+    def _is_qwen(self) -> bool:
+        """按模型名判断是否为千问系列（qwen）：视频走百炼专用链路。"""
+        return "qwen" in self._model.lower()
+
+    def _is_dashscope(self) -> bool:
+        """是否为阿里云百炼直连（dashscope 域名或业务空间专属域名）。"""
+        try:
+            host = (urlparse(self._effective_base()).hostname or "").lower()
+        except Exception:
+            return False
+        return host.endswith("dashscope.aliyuncs.com") or host.endswith(
+            "maas.aliyuncs.com"
+        )
 
     def _is_gemini_protocol(self) -> bool:
         """协议判定：官方接口强制 Gemini；否则按 protocol 配置或模型名判断。"""
@@ -436,8 +585,30 @@ class GeminiClient:
             ],
         }
 
-    def _build_openai_payload(self, video_b64: str, mime_type: str) -> dict:
+    def _build_openai_payload(
+        self, video_b64: str, mime_type: str, fps: float | None = None
+    ) -> dict:
         """OpenAI 兼容协议请求体：视频通过 video_url data URL 内嵌。"""
+        data_url = f"data:{mime_type};base64,{video_b64}"
+        return self._openai_multimodal_payload(data_url, fps)
+
+    def _build_openai_payload_url(self, url: str, fps: float | None = None) -> dict:
+        """OpenAI 兼容协议请求体：视频通过外部 URL（如 oss:// 临时 URL）引用。"""
+        return self._openai_multimodal_payload(url, fps)
+
+    def _openai_multimodal_payload(self, video_ref: str, fps: float | None) -> dict:
+        """构造 OpenAI 兼容协议多模态请求体（video_url 引用，可选 fps）。
+
+        Args:
+            video_ref: video_url.url（公网 URL、oss:// 临时 URL 或 data URL）。
+            fps: 抽帧频率（每秒帧数），仅在 >0 时随请求发送。
+
+        Returns:
+            OpenAI 兼容协议请求体（content 为多模态 part 数组）。
+        """
+        video_part: dict = {"type": "video_url", "video_url": {"url": video_ref}}
+        if fps and fps > 0:
+            video_part["fps"] = fps
         return {
             "model": self._model,
             "messages": [
@@ -446,12 +617,7 @@ class GeminiClient:
                     "role": "user",
                     "content": [
                         {"type": "text", "text": "请分析这段视频。"},
-                        {
-                            "type": "video_url",
-                            "video_url": {
-                                "url": f"data:{mime_type};base64,{video_b64}",
-                            },
-                        },
+                        video_part,
                     ],
                 },
             ],

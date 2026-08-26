@@ -87,6 +87,10 @@ mp4、mov、webm、avi、mpeg、mpg、flv、wmv、3gpp（官方支持的视频�
 
 > **协议自动选择**：模型名包含 `gemini` 时用 Gemini 协议（`generateContent` 端点）；其他模型（`qwen-vl-max`、`gpt-4o` 等）自动用 OpenAI 兼容协议（`/v1/chat/completions`，视频通过 `video_url` data URL 内嵌）。中转站需支持对应协议与视频输入。
 
+> **Kimi（Moonshot）**：模型名含 `kimi` 时，视频自动走 `/v1/files` 文件上传（`purpose=video`）并以 `ms://<file-id>` 引用（官方唯一视频接入方式，单文件 ≤ 100MB）。仅 `kimi-k3`、`kimi-k2.6`、`kimi-k2.7-code`、`kimi-k2.7-code-highspeed` 支持视频理解；`moonshot-v1-*-vision-preview` 系列仅支持图片。参考 [官方文档](https://platform.kimi.com/docs/guide/use-kimi-vision-model)。
+
+> **通义千问（百炼直连）**：小视频 base64 内嵌（官方上限：编码后字符串 < 10MB，这里按约 7.4MB 原始视频留余量）；大视频自动走百炼「免费临时 URL」上传（`oss://` 前缀，单文件 ≤ 1GB，48 小时有效，文件与调用模型绑定）后再分析，调用时会自动携带官方要求的 `X-DashScope-OssResourceResolve: enable` 请求头。仅当接入方为百炼直连（`dashscope.aliyuncs.com` 或 `{WorkspaceId}.xxx.maas.aliyuncs.com`，模型名含 `qwen`）时启用；中转站接入不受影响。注意：官方「临时 URL」示例均基于 `dashscope.aliyuncs.com`，使用业务空间专属域名时请先验证上传接口可用。参考 [上传文件获取临时 URL](https://help.aliyun.com/zh/model-studio/get-temporary-file-url)。
+
 ### 分析设置
 
 **分析模型**
