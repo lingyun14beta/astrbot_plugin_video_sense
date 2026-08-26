@@ -138,8 +138,9 @@ class GeminiClient:
         # 百炼 qwen：小视频 base64 内嵌（官方上限 10MB 字符串），大视频走临时 URL
         if not self._is_gemini_protocol() and self._is_qwen() and self._is_dashscope():
             return await self._analyze_qwen(video)
-        # Kimi：视频只能经文件上传 + ms:// 引用（不区分大小，见 kimi_uploader.py）
-        if not self._is_gemini_protocol() and self._is_kimi():
+        # Kimi：官方接口 + 视频只能经文件上传 + ms:// 引用（见 kimi_uploader.py）。
+        # 仅 Moonshot 官方域名触发；中转站模型名叫 kimi-* 不受影响（ms:// 为 Moonshot 内部协议）
+        if not self._is_gemini_protocol() and self._is_kimi() and self._is_moonshot():
             return await self._analyze_kimi(video)
         inline_limit = self._max_inline_size_mb * _MB
         if video.size_bytes <= inline_limit:
@@ -484,6 +485,14 @@ class GeminiClient:
     def _is_kimi(self) -> bool:
         """按模型名判断是否为 Kimi（Moonshot）：视频走上传 + ms:// 引用。"""
         return "kimi" in self._model.lower()
+
+    def _is_moonshot(self) -> bool:
+        """是否为 Moonshot 官方接口（api.moonshot.cn / api.moonshot.ai）。"""
+        try:
+            host = (urlparse(self._effective_base()).hostname or "").lower()
+        except Exception:
+            return False
+        return host.endswith("moonshot.cn") or host.endswith("moonshot.ai")
 
     def _is_qwen(self) -> bool:
         """按模型名判断是否为千问系列（qwen）：视频走百炼专用链路。"""

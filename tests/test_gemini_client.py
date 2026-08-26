@@ -737,6 +737,29 @@ class TestAnalyzeVideo:
             with pytest.raises(GeminiClientError, match="上传失败：boom"):
                 await client.analyze_video(video)
 
+    async def test_kimi_relay_falls_back_to_inline(self, tmp_path):
+        """中转站的 kimi 模型：不触发 ms:// 上传，走原内嵌路径。"""
+        client = GeminiClient(
+            api_key="k",
+            model="kimi-k3",
+            system_prompt="s",
+            base_url="https://proxy.example.com/v1",
+        )
+        video = self._make_video(1024, tmp_path)
+        sent = {}
+
+        async def fake_post(url, headers, payload):
+            sent["payload"] = payload
+            return "分析结果"
+
+        client._post = fake_post
+        with patch("gemini_client.upload_video_file", new=AsyncMock()) as upload:
+            result = await client.analyze_video(video)
+        assert result == "分析结果"
+        upload.assert_not_awaited()
+        video_part = sent["payload"]["messages"][1]["content"][1]
+        assert video_part["video_url"]["url"].startswith("data:video/mp4;base64,")
+
 
 class TestIsKimi:
     def test_kimi_model(self):
@@ -756,6 +779,33 @@ class TestIsKimi:
             base_url="https://proxy.example.com/v1",
         )
         assert client._is_kimi() is False
+
+    def test_is_moonshot_official(self):
+        client = GeminiClient(
+            api_key="k",
+            model="kimi-k3",
+            system_prompt="s",
+            base_url="https://api.moonshot.cn/v1",
+        )
+        assert client._is_moonshot() is True
+
+    def test_is_moonshot_intl(self):
+        client = GeminiClient(
+            api_key="k",
+            model="kimi-k3",
+            system_prompt="s",
+            base_url="https://api.moonshot.ai/v1",
+        )
+        assert client._is_moonshot() is True
+
+    def test_not_moonshot(self):
+        client = GeminiClient(
+            api_key="k",
+            model="kimi-k3",
+            system_prompt="s",
+            base_url="https://proxy.example.com/v1",
+        )
+        assert client._is_moonshot() is False
 
 
 class TestBuildKimiPayload:
