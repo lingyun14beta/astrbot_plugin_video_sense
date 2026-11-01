@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from unittest.mock import patch
 
@@ -160,6 +161,33 @@ class TestUploadVideoFile:
         """响应为 JSON 数组等非对象结构：给出明确错误而非 AttributeError。"""
         with self._patch_session(_FakeResp(json_data=["not", "an", "object"])):
             with pytest.raises(KimiUploadError, match="格式异常"):
+                await upload_video_file(
+                    "sk-test",
+                    "https://api.moonshot.cn/v1",
+                    str(sample_video_path),
+                    "video/mp4",
+                )
+
+
+class TestUploadTimeout:
+    """上传超时（asyncio.TimeoutError）必须转成 KimiUploadError。"""
+
+    async def test_timeout_maps_to_upload_error(self, sample_video_path):
+        class _TimeoutCM:
+            async def __aenter__(self):
+                raise asyncio.TimeoutError()
+
+            async def __aexit__(self, *args):
+                return False
+
+        class _Session(_FakeClientSession):
+            def post(self, url, headers=None, data=None):
+                return _TimeoutCM()
+
+        with patch(
+            "kimi_uploader.aiohttp.ClientSession", return_value=_Session(None)
+        ):
+            with pytest.raises(KimiUploadError, match="上传超时"):
                 await upload_video_file(
                     "sk-test",
                     "https://api.moonshot.cn/v1",

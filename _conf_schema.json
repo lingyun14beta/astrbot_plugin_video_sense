@@ -251,11 +251,27 @@
         "collapsed": true
       },
       "max_cached_files": {
-        "description": "每会话缓存视频数上限",
-        "hint": "每个会话最多缓存多少个视频条目，超出后自动丢弃最旧的，防止长会话内存膨胀。",
+        "description": "每会话保留视频数上限",
+        "hint": "每个会话保留多少个可用视频文件。超出后最旧的条目会被回收文件并标记为「已过期」，条目本身与已分析结果仍保留（序号不会变动）。",
         "type": "int",
         "slider": { "min": 5, "max": 200, "step": 5 },
         "default": 50,
+        "collapsed": true
+      },
+      "max_entries_per_session": {
+        "description": "每会话保留条目上限",
+        "hint": "每个会话最多保留多少条视频记录（内存与落盘一致，默认 50）。超出后优先删除最旧且未分析的条目，已分析的尽量保留；条目被删后序号会前移。",
+        "type": "int",
+        "slider": { "min": 10, "max": 500, "step": 10 },
+        "default": 50,
+        "collapsed": true
+      },
+      "max_sessions_in_store": {
+        "description": "落盘保留会话数上限",
+        "hint": "缓存落盘时最多保留多少个最近活跃的会话（按该会话最后一条视频时间排序，默认 100）。调大后重启能恢复更多会话的缓存，缓存文件也会相应变大。",
+        "type": "int",
+        "slider": { "min": 10, "max": 500, "step": 10 },
+        "default": 100,
         "collapsed": true
       },
       "auto_compress": {

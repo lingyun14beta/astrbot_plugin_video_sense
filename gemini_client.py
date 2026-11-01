@@ -239,34 +239,50 @@ class GeminiClient:
                 "mime_type": mime_type,
             },
         }
-        async with session.post(
-            self._build_upload_url(), headers=start_headers, json=metadata
-        ) as resp:
-            if resp.status != _HTTP_OK:
-                raw = await resp.text()
-                msg = _extract_error_message(raw) or f"HTTP {resp.status}"
-                raise GeminiClientError(f"上传初始化失败（{resp.status}）：{msg}")
-            upload_url = resp.headers.get("X-Goog-Upload-URL", "").strip()
+        try:
+            async with session.post(
+                self._build_upload_url(), headers=start_headers, json=metadata
+            ) as resp:
+                if resp.status != _HTTP_OK:
+                    raw = await resp.text()
+                    msg = _extract_error_message(raw) or f"HTTP {resp.status}"
+                    raise GeminiClientError(f"上传初始化失败（{resp.status}）：{msg}")
+                upload_url = resp.headers.get("X-Goog-Upload-URL", "").strip()
+        except asyncio.TimeoutError as e:
+            raise GeminiClientError(
+                f"上传初始化超时（>{self._timeout} 秒），请稍后重试。",
+            ) from e
+        except aiohttp.ClientError as e:
+            raise GeminiClientError(f"上传初始化网络异常：{e}") from e
         if not upload_url:
             raise GeminiClientError("上传初始化失败：响应缺少 X-Goog-Upload-URL。")
 
-        # 2) 写入文件字节
-        data = await asyncio.to_thread(p.read_bytes)
+        # 2) 写入文件字节：直接传文件句柄流式发送，避免把上百 MB 读进内存
         put_headers = {
             **self._build_headers(),
-            "Content-Length": str(len(data)),
+            "Content-Length": str(size),
             "X-Goog-Upload-Offset": "0",
             "X-Goog-Upload-Command": "upload, finalize",
         }
-        async with session.put(upload_url, headers=put_headers, data=data) as resp:
-            raw = await resp.text()
-            if resp.status != _HTTP_OK:
-                msg = _extract_error_message(raw) or f"HTTP {resp.status}"
-                raise GeminiClientError(f"上传失败（{resp.status}）：{msg}")
-            try:
-                file_info = json.loads(raw)
-            except json.JSONDecodeError as e:
-                raise GeminiClientError(f"上传响应解析失败：{e}") from e
+        try:
+            with p.open("rb") as fh:
+                async with session.put(
+                    upload_url, headers=put_headers, data=fh
+                ) as resp:
+                    raw = await resp.text()
+                    if resp.status != _HTTP_OK:
+                        msg = _extract_error_message(raw) or f"HTTP {resp.status}"
+                        raise GeminiClientError(f"上传失败（{resp.status}）：{msg}")
+                    try:
+                        file_info = json.loads(raw)
+                    except json.JSONDecodeError as e:
+                        raise GeminiClientError(f"上传响应解析失败：{e}") from e
+        except asyncio.TimeoutError as e:
+            raise GeminiClientError(
+                f"上传超时（>{self._timeout} 秒）：文件较大时请检查网络，或改用更小的视频。",
+            ) from e
+        except aiohttp.ClientError as e:
+            raise GeminiClientError(f"上传网络异常：{e}") from e
 
         f = file_info.get("file") or {}
         name = f.get("name", "")
@@ -324,7 +340,9 @@ class GeminiClient:
                 crf=self._compress_crf,
             )
             b64 = await self._read_base64(compressed.path)
-            return await self.analyze(b64, video.mime_type)
+            # 压缩产物恒为 H.264/AAC 的 mp4，必须按 video/mp4 声明，
+            # 不能沿用源视频格式（如 video/x-flv），否则严格校验的上游会拒绝。
+            return await self.analyze(b64, "video/mp4")
         except FfmpegError as e:
             raise GeminiClientError(f"视频压缩失败：{e}") from e
         finally:
@@ -446,15 +464,24 @@ class GeminiClient:
         deadline = loop.time() + timeout
         delay = 1.0
         while True:
-            async with session.get(get_url, headers=self._build_headers()) as resp:
-                raw = await resp.text()
-                if resp.status != _HTTP_OK:
-                    msg = _extract_error_message(raw) or f"HTTP {resp.status}"
-                    raise GeminiClientError(f"查询文件状态失败（{resp.status}）：{msg}")
-                try:
-                    data = json.loads(raw)
-                except json.JSONDecodeError as e:
-                    raise GeminiClientError(f"查询文件状态响应解析失败：{e}") from e
+            try:
+                async with session.get(get_url, headers=self._build_headers()) as resp:
+                    raw = await resp.text()
+                    if resp.status != _HTTP_OK:
+                        msg = _extract_error_message(raw) or f"HTTP {resp.status}"
+                        raise GeminiClientError(
+                            f"查询文件状态失败（{resp.status}）：{msg}"
+                        )
+                    try:
+                        data = json.loads(raw)
+                    except json.JSONDecodeError as e:
+                        raise GeminiClientError(f"查询文件状态响应解析失败：{e}") from e
+            except asyncio.TimeoutError as e:
+                raise GeminiClientError(
+                    f"查询文件处理状态超时（>{self._timeout} 秒），请稍后重试。",
+                ) from e
+            except aiohttp.ClientError as e:
+                raise GeminiClientError(f"查询文件状态网络异常：{e}") from e
             f = data.get("file") or {}
             state = f.get("state", "")
             if state == _FILE_STATE_ACTIVE:
@@ -657,6 +684,13 @@ class GeminiClient:
                     f"[retryable] 服务端错误（{resp.status}）：{msg}",
                 )
 
+        except asyncio.TimeoutError as e:
+            # aiohttp 的总超时抛 asyncio.TimeoutError（3.11 起即内建 TimeoutError），
+            # 不是 ClientError，必须单独捕获，否则会以裸异常穿出插件。
+            raise GeminiClientError(
+                f"请求超时（>{self._timeout} 秒）：视频较大或服务繁忙，"
+                "可在接入方配置里调高超时时间，或压缩/截短视频后重试。",
+            ) from e
         except aiohttp.ClientError as e:
             raise GeminiClientError(f"[retryable] 网络请求异常：{e}") from e
 

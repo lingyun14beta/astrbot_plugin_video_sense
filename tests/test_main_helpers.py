@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import sys
 from pathlib import Path
@@ -32,14 +33,14 @@ def _stub_astrbot():
 
     class _MessageChainStub:
         def __init__(self):
-            self._text = ""
+            self.chain = []
 
         def message(self, text):
-            self._text = str(text)
+            self.chain.append(str(text))
             return self
 
         def __str__(self):
-            return self._text
+            return "".join(self.chain)
 
     stub_modules["astrbot.api.event"].MessageChain = _MessageChainStub
 
@@ -304,3 +305,102 @@ class TestFormatVideoList:
         text = _main._format_video_list(items)
         assert "1. a.mp4（刚刚） [已分析]" in text
         assert "2. b.mp4（1小时前）" in text
+
+
+class TestBuildTextChain:
+    """把 send_message_to_user 的 messages 参数转成只含文本的消息链。"""
+
+    def test_plain_messages_are_joined(self):
+        chain = _main._build_text_chain(
+            [{"type": "plain", "text": "a"}, {"type": "plain", "text": "b"}]
+        )
+        assert chain.chain == ["a", "b"]
+
+    def test_accepts_plain_string(self):
+        chain = _main._build_text_chain("只有一段话")
+        assert chain.chain == ["只有一段话"]
+
+    def test_skips_non_plain_components(self):
+        chain = _main._build_text_chain(
+            [{"type": "image", "path": "x.png"}, {"type": "plain", "text": "说明"}]
+        )
+        assert chain.chain == ["说明"]
+
+    def test_returns_none_for_empty(self):
+        assert _main._build_text_chain([]) is None
+        assert _main._build_text_chain(None) is None
+        assert _main._build_text_chain([{"type": "plain", "text": "   "}]) is None
+
+
+class TestBackgroundDedupe:
+    """同一视频的并发提交只跑一次；不同视频各自执行。"""
+
+    def _make_plugin(self):
+        send = AsyncMock()
+        context = SimpleNamespace(send_message=send)
+        plugin = _main.VideoSensePlugin(context=context, config={})
+        plugin._wake_ai_for_result = AsyncMock(return_value=False)
+        return plugin, send
+
+    async def test_same_task_key_runs_once(self):
+        plugin, send = self._make_plugin()
+        seen = []
+
+        async def first():
+            seen.append("first")
+            await asyncio.sleep(0.02)
+            return "结果一"
+
+        async def duplicate():
+            seen.append("duplicate")
+            return "结果二"
+
+        assert plugin._run_background_analysis(
+            "umo", first(), task_key=("umo", "v1")
+        )
+        assert (
+            plugin._run_background_analysis(
+                "umo", duplicate(), task_key=("umo", "v1")
+            )
+            is False
+        )
+        for task in list(plugin._bg_tasks):
+            await task
+
+        assert seen == ["first"]
+        assert plugin._inflight == {}
+        send.assert_awaited_once()
+
+    async def test_different_keys_run_both(self):
+        plugin, _ = self._make_plugin()
+        seen = []
+
+        async def work(tag):
+            seen.append(tag)
+            return tag
+
+        assert plugin._run_background_analysis(
+            "umo", work("a"), task_key=("umo", "a")
+        )
+        assert plugin._run_background_analysis(
+            "umo", work("b"), task_key=("umo", "b")
+        )
+        for task in list(plugin._bg_tasks):
+            await task
+
+        assert sorted(seen) == ["a", "b"]
+
+
+class TestHintGating:
+    async def test_disabled_llm_tool_skips_injection(self):
+        """关闭 LLM 工具后不应再注入"视频感知"提示。"""
+        plugin = _main.VideoSensePlugin(
+            context=SimpleNamespace(send_message=AsyncMock()), config={}
+        )
+        plugin.config = {"analysis": {"enable_llm_tool": False}}
+        plugin._pending_hints["umo1"] = ["a.mp4"]
+
+        req = SimpleNamespace(contexts=[])
+        await plugin._on_llm_request(SimpleNamespace(unified_msg_origin="umo1"), req)
+
+        assert req.contexts == []

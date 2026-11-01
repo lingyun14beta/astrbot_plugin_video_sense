@@ -60,12 +60,14 @@ class TestResolveVideoRef:
             "is_local": True,
             "result": None,
         }
-        from video_utils import VideoError
+        from video_utils import VideoExpiredError
 
-        with pytest.raises(VideoError, match="过期"):
+        with pytest.raises(VideoExpiredError, match="已被清理"):
             await resolve_video_ref(item, 20)
 
-    async def test_remote_downloads(self, sample_video_path):
+    async def test_remote_downloads(
+        self, sample_video_path, response_factory, session_factory
+    ):
         item = {
             "name": "clip.mp4",
             "ref": "https://example.com/clip.mp4",
@@ -73,34 +75,24 @@ class TestResolveVideoRef:
             "result": None,
         }
 
-        class MockResp:
-            status = 200
-            headers = {}
-
-            async def read(self):
-                return sample_video_path.read_bytes()
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *args):
-                pass
-
-        class MockSession:
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *args):
-                pass
-
-            def get(self, url):
-                return MockResp()
-
-        with patch("video_utils.aiohttp.ClientSession", return_value=MockSession()):
+        session = session_factory(
+            {
+                "https://example.com/clip.mp4": response_factory(
+                    sample_video_path.read_bytes()
+                )
+            }
+        )
+        with (
+            patch("video_utils.aiohttp.ClientSession", return_value=session),
+            patch(
+                "video_utils._assert_public_url", new=AsyncMock(return_value=None)
+            ),
+        ):
             result = await resolve_video_ref(item, 20)
             assert Path(result).is_file()
             assert item["is_local"] is True
             assert item["ref"] == result
+            assert item["downloaded"] is True
 
     async def test_empty_ref(self):
         item = {
@@ -109,7 +101,7 @@ class TestResolveVideoRef:
             "is_local": False,
             "result": None,
         }
-        from video_utils import VideoError
+        from video_utils import VideoExpiredError
 
-        with pytest.raises(VideoError, match="为空"):
+        with pytest.raises(VideoExpiredError, match="已被回收"):
             await resolve_video_ref(item, 20)

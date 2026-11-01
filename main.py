@@ -28,10 +28,12 @@ from .llm_tools import (
 )
 from .video_utils import (
     VideoError,
+    VideoExpiredError,
     extract_file_component,
     load_video,
     resolve_component_ref,
     video_component_name,
+    video_ref_status,
 )
 
 _DEFAULT_SYSTEM_PROMPT = (
@@ -48,9 +50,110 @@ _DEFAULT_COMMAND_SYSTEM_PROMPT = (
 
 _ERROR_PREFIXES = ("文件处理失败", "视频分析失败")
 
+# 全局并发上限：视频分析单次耗时数十秒，避免多会话同时打满上游配额
+_MAX_CONCURRENT_ANALYSES = 2
+# 待注入的"视频感知"提示最多保留多少条，防止 LLM 长期不响应时无限累积
+_MAX_PENDING_HINTS = 10
+# 唤醒主 Agent 的最多步数：只需一次工具调用把结果发出去
+_WAKE_MAX_STEPS = 5
+# 单会话条目上限的默认值（可在配置里改，见 analysis.max_entries_per_session）
+_DEFAULT_MAX_ENTRIES_PER_SESSION = 50
+# 缓存落盘：文件名与合并写入的窗口
+_STORE_FILENAME = "video_cache.json"
+_SAVE_DEBOUNCE_SECONDS = 0.5
+# 落盘保留会话数的默认值（可在配置里改，见 analysis.max_sessions_in_store）
+_DEFAULT_MAX_SESSIONS_IN_STORE = 100
+
+# 过期提示：日志、LLM 工具返回、指令回复三处统一口径
+_EXPIRED_TOOL_HINT = (
+    "缓存只保存文件引用，平台链接和临时文件都会过期。"
+    "请让用户重新发送一次这个视频（引用原消息也可以），再调用 analyze_current_video；"
+    "不要重复调用本工具，也不要改用其他序号。"
+)
+
+# 插件自己的发送工具参数表（名称与框架内置工具一致，避免改提示词）
+_SEND_MESSAGE_TOOL_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "messages": {
+            "type": "array",
+            "description": "要发送的消息列表，type=plain 时取用 text 字段。",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "type": {
+                        "type": "string",
+                        "description": "消息类型，固定为 plain。",
+                    },
+                    "text": {
+                        "type": "string",
+                        "description": "要发送的文本内容。",
+                    },
+                },
+                "required": ["type"],
+            },
+        },
+    },
+    "required": ["messages"],
+}
+
+
+def _build_text_chain(messages) -> MessageChain | None:
+    """把 send_message_to_user 的 messages 参数转成只含文本的 MessageChain。
+
+    Args:
+        messages: 工具参数里的消息数组（也接受单个字符串）。
+
+    Returns:
+        含文本的消息链；没有任何可发送文本时返回 None。
+    """
+    if isinstance(messages, str):
+        messages = [{"type": "plain", "text": messages}]
+
+    texts: list[str] = []
+    for item in messages or []:
+        if isinstance(item, str):
+            if item.strip():
+                texts.append(item)
+            continue
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("type") or "plain").lower() not in ("plain", "text"):
+            continue
+        text = item.get("text")
+        if isinstance(text, str) and text.strip():
+            texts.append(text)
+
+    if not texts:
+        return None
+    chain = MessageChain()
+    for text in texts:
+        chain.message(text)
+    return chain
+
 
 def _is_error(text: str) -> bool:
     return text.startswith(_ERROR_PREFIXES)
+
+
+def _reclaim_item(item: dict) -> str | None:
+    """回收插件自己下载的临时文件，返回待删除路径（适配器临时文件不归我们删）。"""
+    if not item.get("downloaded"):
+        return None
+    ref = (item.get("ref") or "").strip()
+    item["ref"] = ""
+    item["is_local"] = False
+    item["downloaded"] = False
+    return ref or None
+
+
+def _delete_files(paths: list[str]) -> None:
+    """删除回收的临时文件（在线程池里调用，失败只记日志）。"""
+    for path in paths:
+        try:
+            Path(path).unlink(missing_ok=True)
+        except OSError:
+            logger.debug("[VideoSense] 删除临时文件失败：%s", path)
 
 
 def _format_relative_time(ts: float) -> str:
@@ -66,11 +169,16 @@ def _format_relative_time(ts: float) -> str:
 
 
 def _format_video_list(items: list[dict]) -> str:
-    """格式化缓存视频列表（含相对接收时间），供 LLM 分辨新旧。"""
+    """格式化缓存视频列表（含相对接收时间与可用性），供 LLM 分辨新旧与能否分析。"""
     lines = []
     for i, item in enumerate(items):
         when = _format_relative_time(item.get("received_at", 0))
-        tag = " [已分析]" if item["result"] else ""
+        if item["result"]:
+            # 已分析：结果已缓存，文件是否还在都不影响查看
+            tag = " [已分析]"
+        else:
+            usable, _reason = video_ref_status(item)
+            tag = "" if usable else " [已过期]"
         lines.append(f"{i + 1}. {item['name']}（{when}）{tag}")
     return "\n".join(lines)
 
@@ -96,8 +204,13 @@ class VideoSensePlugin(Star):
         self._registry: dict[str, list[dict]] = {}
         self._lock = asyncio.Lock()
         self._bg_tasks: set[asyncio.Task] = set()
+        self._inflight: dict[tuple[str, str], asyncio.Task] = {}  # 在跑的分析任务
+        self._analysis_sem = asyncio.Semaphore(_MAX_CONCURRENT_ANALYSES)
         self._video_hints: dict[str, set[str]] = {}  # umo -> 已提示过 LLM 的视频名
         self._pending_hints: dict[str, list[str]] = {}  # umo -> 待注入的视频名
+        self._data_dir: Path | None = None
+        self._save_task: asyncio.Task | None = None
+        self._init_store()
         self._log_ffmpeg_status()
         logger.info("[VideoSense] 插件已加载，支持格式：%s", self._supported_formats)
 
@@ -148,6 +261,30 @@ class VideoSensePlugin(Star):
     @property
     def _max_cached_files(self) -> int:
         return max(1, int(self._analysis_cfg.get("max_cached_files", 50)))
+
+    @property
+    def _max_entries_per_session(self) -> int:
+        """每会话保留的条目上限（内存与落盘一致）。"""
+        return max(
+            1,
+            int(
+                self._analysis_cfg.get(
+                    "max_entries_per_session", _DEFAULT_MAX_ENTRIES_PER_SESSION
+                )
+            ),
+        )
+
+    @property
+    def _max_sessions_in_store(self) -> int:
+        """落盘时最多保留多少个最近活跃的会话。"""
+        return max(
+            1,
+            int(
+                self._analysis_cfg.get(
+                    "max_sessions_in_store", _DEFAULT_MAX_SESSIONS_IN_STORE
+                )
+            ),
+        )
 
     @property
     def _auto_compress(self) -> bool:
@@ -263,10 +400,18 @@ class VideoSensePlugin(Star):
             local, url = resolve_component_ref(comp)
             ref = local if (local and Path(local).is_file()) else (url or local)
             is_local = bool(local and Path(local).is_file())
-            # 去重：同名同引用的视频（如反复引用同一消息）只缓存一次，但刷新接收时间
+            # 去重：同名同引用的视频（如反复引用同一消息）只缓存一次，但刷新接收时间，
+            # 并用本次组件重新绑定引用（旧 URL 过期/本地文件被清理时能顺手修正）
             for it in items:
                 if it["name"] == name and it["ref"] == ref:
                     it["received_at"] = time.time()
+                    if local and Path(local).is_file():
+                        it["ref"] = local
+                        it["is_local"] = True
+                        it["downloaded"] = False
+                    elif it["is_local"] and not Path(it["ref"]).is_file():
+                        it["ref"] = url or ""
+                        it["is_local"] = False
                     return
             items.append(
                 {
@@ -289,23 +434,28 @@ class VideoSensePlugin(Star):
                     for rc in getattr(comp, "chain", []) or []:
                         if type(rc).__name__ in ("File", "Video"):
                             _cache(rc, items)
+
+            # 超出文件预算：只回收最旧条目的文件引用，条目本身保留（序号不漂移），
+            # 列表里会显示为「已过期」；已分析结果不受影响。
+            to_delete = self._apply_limits(items)
+
+            # 已提示集合跟着缓存一起收敛，被回收的条目再次发送时会重新提示
+            hinted &= {item["name"] for item in items}
+
             # 记录需要提示 LLM 的新视频（去重后新增的、未提示过的）
             for item in items:
                 if item["name"] not in hinted:
                     new_hints.append(item["name"])
                     hinted.add(item["name"])
             if new_hints:
-                self._pending_hints.setdefault(umo, []).extend(new_hints)
+                pending = self._pending_hints.setdefault(umo, [])
+                pending.extend(new_hints)
+                if len(pending) > _MAX_PENDING_HINTS:
+                    del pending[:-_MAX_PENDING_HINTS]
 
-        # 缓存上限裁剪：保留最近的 N 个，避免长会话无限膨胀
-        max_cached = self._max_cached_files
-        if len(items) > max_cached:
-            overflow = len(items) - max_cached
-            async with self._lock:
-                del items[:overflow]
-            if self._debug:
-                logger.info("[VideoSense] 缓存超限，裁剪 %d 个最旧条目", overflow)
-
+        if to_delete:
+            await asyncio.to_thread(_delete_files, to_delete)
+        self._schedule_save()
         yield
 
     # ------------------------------------------------------------------
@@ -320,6 +470,8 @@ class VideoSensePlugin(Star):
         此提示引导它调用 list_video_files / analyze_current_video。
         """
         umo = event.unified_msg_origin
+        if not self._analysis_cfg.get("enable_llm_tool", True):
+            return
         async with self._lock:
             pending = self._pending_hints.pop(umo, [])
         if not pending:
@@ -342,16 +494,36 @@ class VideoSensePlugin(Star):
     # 后台分析（LLM 工具场景：立即返回，结果唤醒 AI 发送）
     # ------------------------------------------------------------------
 
-    def _run_background_analysis(self, umo: str, coro) -> None:
+    def _run_background_analysis(
+        self,
+        umo: str,
+        coro,
+        task_key: tuple[str, str] | None = None,
+    ) -> bool:
         """后台执行分析协程，完成后唤醒主 Agent 以角色口吻发送结果。
 
         AstrBot 对 LLM 工具调用有 120 秒硬超时，视频分析可能超时，
         故工具只提交任务立即返回，耗时分析在此后台执行（无超时限制）。
+
+        Args:
+            umo: 会话标识，用于回复与唤醒。
+            coro: 实际执行分析的协程。
+            task_key: 去重键 (umo, 资源标识)；同一资源已有任务在跑时不重复提交。
+
+        Returns:
+            是否真的提交了新任务；重复提交时返回 False（传入的协程会被关闭）。
         """
+        if task_key is not None:
+            existing = self._inflight.get(task_key)
+            if existing is not None and not existing.done():
+                # 丢弃重复提交的协程，避免 "coroutine was never awaited" 警告
+                coro.close()
+                return False
 
         async def _wrapper() -> None:
             try:
-                result = await coro
+                async with self._analysis_sem:
+                    result = await coro
             except Exception as e:
                 logger.error("[VideoSense] 后台分析异常", exc_info=True)
                 await self._deliver_result(umo, f"视频分析失败：{e}")
@@ -360,7 +532,16 @@ class VideoSensePlugin(Star):
 
         task = asyncio.create_task(_wrapper())
         self._bg_tasks.add(task)
-        task.add_done_callback(self._bg_tasks.discard)
+        if task_key is not None:
+            self._inflight[task_key] = task
+
+        def _cleanup(done: asyncio.Task) -> None:
+            self._bg_tasks.discard(done)
+            if task_key is not None and self._inflight.get(task_key) is done:
+                self._inflight.pop(task_key, None)
+
+        task.add_done_callback(_cleanup)
+        return True
 
     async def _deliver_result(self, umo: str, result_text: str) -> None:
         """交付分析结果：优先唤醒 AI 以角色口吻发送，失败兜底直接发送。"""
@@ -376,12 +557,21 @@ class VideoSensePlugin(Star):
         """唤醒主 Agent 处理视频分析结果（借鉴 image_generation 的任务完成唤醒机制）。
 
         构造一次带完整会话上下文的主动 Agent 回合，让 LLM 用角色口吻
-        通过 send_message_to_user 把结果发送给用户。
+        把结果发送给用户。
+
+        发送工具由插件自己提供（沿用框架工具的 name，参数表见
+        ``_SEND_MESSAGE_TOOL_SCHEMA``）：工具真正调用成功才把 delivered 置位，
+        因此不再依赖上游工具返回的界面文案，也不会因上游改文案而判定失败、
+        把同一份结果重复发送两遍。
+
+        Args:
+            umo: 会话标识。
+            result_text: 待交付的分析结果（或失败原因）。
 
         Returns:
-            AI 是否成功发送了消息。
+            AI 是否成功把消息发给了用户。
         """
-        from astrbot.core.agent.tool import ToolSet
+        from astrbot.core.agent.tool import FunctionTool, ToolSet
         from astrbot.core.astr_main_agent import (
             MainAgentBuildConfig,
             _get_session_conv,
@@ -390,7 +580,6 @@ class VideoSensePlugin(Star):
         from astrbot.core.cron.events import CronMessageEvent
         from astrbot.core.platform.message_session import MessageSession
         from astrbot.core.provider.entities import ProviderRequest
-        from astrbot.core.tools.message_tools import SendMessageToUserTool
 
         system_prompt = (
             "你是一个自主 Agent。你被唤醒是因为之前提交的视频分析任务已完成。\n"
@@ -433,10 +622,30 @@ class VideoSensePlugin(Star):
             )
         req.system_prompt += system_prompt
         req.prompt = "请按系统指令把视频分析结果发送给用户。"
-        req.func_tool = ToolSet()
-        req.func_tool.add_tool(
-            self.context.get_llm_tool_manager().get_builtin_tool(SendMessageToUserTool)
+
+        delivered = {"sent": False}
+
+        async def _send_message_tool(event, **kwargs) -> str:
+            chain = _build_text_chain(kwargs.get("messages"))
+            if chain is None:
+                return "未发送：messages 为空或不含可发送的文本内容。"
+            if not await self.context.send_message(umo, chain):
+                return "未发送：找不到对应的平台会话。"
+            delivered["sent"] = True
+            return "已发送给用户。"
+
+        send_tool = FunctionTool(
+            name="send_message_to_user",
+            description=(
+                "把消息发送给用户。messages 为消息数组，"
+                '每项形如 {"type": "plain", "text": "要发送的文字"}。'
+            ),
+            parameters=_SEND_MESSAGE_TOOL_SCHEMA,
+            handler=_send_message_tool,
         )
+
+        req.func_tool = ToolSet()
+        req.func_tool.add_tool(send_tool)
 
         config = MainAgentBuildConfig(
             tool_call_timeout=tool_call_timeout,
@@ -459,25 +668,14 @@ class VideoSensePlugin(Star):
 
         # 裁剪工具：本次主动回合只允许发送消息
         result.provider_request.func_tool = ToolSet()
-        result.provider_request.func_tool.add_tool(
-            self.context.get_llm_tool_manager().get_builtin_tool(SendMessageToUserTool)
-        )
+        result.provider_request.func_tool.add_tool(send_tool)
         if result.reset_coro:
             await result.reset_coro
 
-        sent = False
-        runner = result.agent_runner
-        async for agent_resp in runner.step_until_done(30):
-            if agent_resp.type != "tool_call_result":
-                continue
-            chain = agent_resp.data.get("chain")
-            if not chain:
-                continue
-            content = chain.get_plain_text(with_other_comps_mark=True)
-            if "Message sent to session" in content:
-                sent = True
+        async for _resp in result.agent_runner.step_until_done(_WAKE_MAX_STEPS):
+            if delivered["sent"]:
                 break
-        return sent
+        return delivered["sent"]
 
     async def _safe_send(self, umo: str, text: str) -> None:
         """向会话主动发送文本，失败仅记日志（不中断后台任务）。"""
@@ -550,12 +748,42 @@ class VideoSensePlugin(Star):
 
         item = items[idx]
         if item["result"]:
+            # 已分析：结果还在，文件是否已被清理都不影响
             yield event.plain_result(f"「{item['name']}」(已缓存) {item['result']}")
+            return
+
+        usable, reason = video_ref_status(item)
+        if not usable:
+            logger.warning(
+                "[VideoSense] 缓存视频已过期：umo=%s name=%s ref=%s reason=%s",
+                umo,
+                item["name"],
+                item.get("ref", ""),
+                reason,
+            )
+            yield event.plain_result(
+                f"「{item['name']}」已过期：{reason}。"
+                "请重新发送一次这个视频（引用原消息也可以）再试。"
+            )
             return
 
         try:
             resolved = await resolve_video_ref(item, self._max_size_mb)
+        except VideoExpiredError as e:
+            logger.warning(
+                "[VideoSense] 缓存视频已过期：umo=%s name=%s ref=%s reason=%s",
+                umo,
+                item["name"],
+                item.get("ref", ""),
+                e,
+            )
+            yield event.plain_result(
+                f"「{item['name']}」已过期：{e}。"
+                "请重新发送一次这个视频（引用原消息也可以）再试。"
+            )
+            return
         except VideoError as e:
+            logger.warning("[VideoSense] 缓存视频不可用：%s", e)
             yield event.plain_result(f"「{item['name']}」文件不可用：{e}")
             return
 
@@ -568,6 +796,7 @@ class VideoSensePlugin(Star):
             if not _is_error(result):
                 async with self._lock:
                     item["result"] = result
+                self._schedule_save()
             yield event.plain_result(f"「{item['name']}」{result}")
         finally:
             await client.close()
@@ -590,7 +819,8 @@ class VideoSensePlugin(Star):
             return "视频分析功能未启用。"
 
         umo = event.unified_msg_origin
-        if extract_file_component(event) is None:
+        file_comp = extract_file_component(event)
+        if file_comp is None:
             # 当前消息没有携带视频：列出缓存（含时间），引导 LLM 按语境选序号
             async with self._lock:
                 items = list(self._registry.get(umo, []))
@@ -605,7 +835,16 @@ class VideoSensePlugin(Star):
                 "调用 analyze_video_by_number 指定序号分析。"
             )
 
-        self._run_background_analysis(umo, self._analyze_current_async(event, question))
+        submitted = self._run_background_analysis(
+            umo,
+            self._analyze_current_async(event, question),
+            task_key=(umo, f"current:{video_component_name(file_comp)}"),
+        )
+        if not submitted:
+            return (
+                "⏳ 这个视频已经在后台分析了，完成后插件会直接把结果发送给用户，"
+                "无需重复调用。"
+            )
         return (
             "⏳ 视频分析任务已提交，正在后台执行（视频分析可能需要数十秒）。"
             "分析完成后插件会直接把结果发送给用户，"
@@ -636,6 +875,7 @@ class VideoSensePlugin(Star):
                         if item["name"] == name and item["result"] is None:
                             item["result"] = result
                             break
+                self._schedule_save()
         return result
 
     @llm_tool("list_video_files")
@@ -680,9 +920,27 @@ class VideoSensePlugin(Star):
         item = items[number - 1]
 
         if item["result"]:
+            # 已分析：直接返回缓存结果，不依赖文件是否还在
             return f"「{item['name']}」(已缓存结果) {item['result']}"
 
-        self._run_background_analysis(umo, self._analyze_number_async(umo, item))
+        usable, reason = video_ref_status(item)
+        if not usable:
+            logger.warning(
+                "[VideoSense] 缓存视频已过期：umo=%s name=%s ref=%s reason=%s",
+                umo,
+                item["name"],
+                item.get("ref", ""),
+                reason,
+            )
+            return f"「{item['name']}」已过期：{reason}。{_EXPIRED_TOOL_HINT}"
+
+        submitted = self._run_background_analysis(
+            umo,
+            self._analyze_number_async(umo, item),
+            task_key=(umo, f"number:{item['ref'] or item['name']}"),
+        )
+        if not submitted:
+            return f"⏳ 「{item['name']}」正在分析中，完成后会自动把结果发给用户。"
         return (
             f"⏳ 已提交后台分析「{item['name']}」（视频分析可能需要数十秒）。"
             "分析完成后插件会直接把结果发送给用户，"
@@ -693,8 +951,22 @@ class VideoSensePlugin(Star):
         """后台执行按序号分析，返回要发送给用户的结果文本。"""
         try:
             resolved_path = await resolve_video_ref(item, self._max_size_mb)
+        except VideoExpiredError as e:
+            logger.warning(
+                "[VideoSense] 缓存视频已过期：umo=%s name=%s ref=%s reason=%s",
+                umo,
+                item["name"],
+                item.get("ref", ""),
+                e,
+            )
+            return (
+                f"「{item['name']}」已过期：{e}。"
+                "请让用户重新发送一次这个视频（引用原消息也可以）后再分析。"
+            )
         except VideoError as e:
+            logger.warning("[VideoSense] 缓存视频不可用：%s", e)
             return f"「{item['name']}」文件不可用：{e}"
+        self._schedule_save()  # ref 已更新为本地文件
 
         client = self._make_client()
         try:
@@ -707,7 +979,182 @@ class VideoSensePlugin(Star):
         if not _is_error(result):
             async with self._lock:
                 item["result"] = result
+            self._schedule_save()
         return f"「{item['name']}」{result}"
+
+    # ------------------------------------------------------------------
+    # 缓存限额与持久化
+    # ------------------------------------------------------------------
+
+    def _apply_limits(self, items: list[dict]) -> list[str]:
+        """按预算回收临时文件，条目本身保留（避免序号漂移）。
+
+        已分析的条目优先回收：结果已经缓存，文件只剩"再分析一次"的用途；
+        未分析的文件尽量留着，保证还能分析。
+
+        Args:
+            items: 当前会话的缓存条目（就地修改）。
+
+        Returns:
+            需要删除的本地文件路径。
+        """
+        to_delete: list[str] = []
+        max_cached = self._max_cached_files
+        keep_files = [
+            item for item in items if item.get("downloaded") and item.get("ref")
+        ]
+        if len(keep_files) > max_cached:
+            overflow = len(keep_files) - max_cached
+            ordered = sorted(
+                keep_files,
+                key=lambda it: (
+                    0 if it.get("result") else 1,
+                    it.get("received_at") or 0,
+                ),
+            )
+            for item in ordered[:overflow]:
+                path = _reclaim_item(item)
+                if path:
+                    to_delete.append(path)
+            if self._debug:
+                logger.info("[VideoSense] 超出文件预算，回收 %d 个临时文件", overflow)
+
+        # 条目硬上限：优先删除最旧的、没有分析结果的条目
+        max_entries = self._max_entries_per_session
+        while len(items) > max_entries:
+            index = next(
+                (i for i, item in enumerate(items) if not item.get("result")), 0
+            )
+            removed = items.pop(index)
+            path = _reclaim_item(removed)
+            if path:
+                to_delete.append(path)
+        return to_delete
+
+    def _init_store(self) -> None:
+        """初始化缓存存储目录并恢复上次的缓存（失败则退化为纯内存）。"""
+        try:
+            from astrbot.api.star import StarTools
+
+            self._data_dir = Path(StarTools.get_data_dir("astrbot_plugin_video_sense"))
+        except Exception:
+            self._data_dir = None
+            logger.info("[VideoSense] 无法获取插件数据目录，缓存仅保存在内存中")
+            return
+        self._load_registry()
+
+    def _store_path(self) -> Path:
+        assert self._data_dir is not None
+        return self._data_dir / _STORE_FILENAME
+
+    def _load_registry(self) -> None:
+        """从磁盘恢复缓存条目。失效引用会在使用时报「已过期」，不影响已分析结果。"""
+        if self._data_dir is None:
+            return
+        path = self._store_path()
+        if not path.is_file():
+            return
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as e:
+            logger.warning("[VideoSense] 读取缓存失败，忽略旧缓存：%s", e)
+            return
+        sessions = data.get("sessions") if isinstance(data, dict) else None
+        if not isinstance(sessions, dict):
+            return
+
+        restored = 0
+        for umo, items in sessions.items():
+            if not isinstance(umo, str) or not isinstance(items, list):
+                continue
+            entries: list[dict] = []
+            for item in items[-self._max_entries_per_session :]:
+                if not isinstance(item, dict):
+                    continue
+                name = item.get("name")
+                ref = item.get("ref")
+                if not isinstance(name, str) or not name or not isinstance(ref, str):
+                    continue
+                result = item.get("result")
+                try:
+                    received_at = float(item.get("received_at") or 0)
+                except (TypeError, ValueError):
+                    received_at = 0.0
+                entries.append(
+                    {
+                        "name": name,
+                        "ref": ref,
+                        "is_local": bool(item.get("is_local")),
+                        "result": result if isinstance(result, str) else None,
+                        "received_at": received_at,
+                        "downloaded": bool(item.get("downloaded")),
+                    }
+                )
+            if entries:
+                self._registry[umo] = entries
+                restored += len(entries)
+        max_sessions = self._max_sessions_in_store
+        if len(self._registry) > max_sessions:
+            keep = sorted(
+                self._registry,
+                key=lambda umo: max(
+                    (item.get("received_at") or 0 for item in self._registry[umo]),
+                    default=0,
+                ),
+                reverse=True,
+            )[:max_sessions]
+            self._registry = {umo: self._registry[umo] for umo in keep}
+        if restored:
+            logger.info("[VideoSense] 已从磁盘恢复 %d 个视频缓存条目", restored)
+
+    async def _persist(self) -> None:
+        """把当前缓存原子写回磁盘（失败只记日志）。"""
+        if self._data_dir is None:
+            return
+        async with self._lock:
+            active = [(umo, items) for umo, items in self._registry.items() if items]
+        active.sort(
+            key=lambda pair: max(
+                (item.get("received_at") or 0 for item in pair[1]), default=0
+            ),
+            reverse=True,
+        )
+        snapshot = {
+            umo: [dict(item) for item in items]
+            for umo, items in active[: self._max_sessions_in_store]
+        }
+        path = self._store_path()
+
+        def _write() -> None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text(
+                json.dumps({"version": 1, "sessions": snapshot}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            tmp.replace(path)
+
+        try:
+            await asyncio.to_thread(_write)
+        except OSError as e:
+            logger.warning("[VideoSense] 写入缓存失败：%s", e)
+
+    def _schedule_save(self) -> None:
+        """合并短时间内的多次改动，避免频繁写盘。"""
+        if self._data_dir is None:
+            return
+        if self._save_task is not None and not self._save_task.done():
+            return
+        self._save_task = asyncio.create_task(self._save_later())
+
+    async def _save_later(self) -> None:
+        try:
+            await asyncio.sleep(_SAVE_DEBOUNCE_SECONDS)
+            await self._persist()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("[VideoSense] 缓存落盘失败", exc_info=True)
 
     # ------------------------------------------------------------------
     # 核心分析逻辑
@@ -741,6 +1188,11 @@ class VideoSensePlugin(Star):
         for task in list(self._bg_tasks):
             task.cancel()
         self._bg_tasks.clear()
+        self._inflight.clear()
+        if self._save_task is not None:
+            self._save_task.cancel()
+            self._save_task = None
+        await self._persist()
         self._registry.clear()
         self._video_hints.clear()
         self._pending_hints.clear()

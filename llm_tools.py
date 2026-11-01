@@ -6,6 +6,7 @@ try:
     from .gemini_client import GeminiClient, GeminiClientError
     from .video_utils import (
         VideoError,
+        VideoExpiredError,
         download_video_file,
         extract_file_component,
         load_video,
@@ -15,6 +16,7 @@ except ImportError:
     from gemini_client import GeminiClient, GeminiClientError
     from video_utils import (
         VideoError,
+        VideoExpiredError,
         download_video_file,
         extract_file_component,
         load_video,
@@ -61,21 +63,34 @@ async def resolve_video_ref(
     item: dict,
     max_size_mb: int,
 ) -> str:
-    """将缓存的视频引用解析为可用路径。local 直接用，remote 按需下载。"""
-    ref = item["ref"]
-    if not ref:
-        raise VideoError("文件引用为空。")
+    """将缓存的视频引用解析为可用路径。local 直接用，remote 按需下载。
 
-    if item["is_local"]:
+    Args:
+        item: 缓存条目（ref / is_local / name），解析成功后就地更新 ref 与 is_local。
+        max_size_mb: 下载大小上限。
+
+    Returns:
+        可用的本地文件路径。
+
+    Raises:
+        VideoExpiredError: 引用为空、本地文件已被清理，或平台链接已过期。
+        VideoError: 其他下载失败。
+    """
+    ref = (item.get("ref") or "").strip()
+    if not ref:
+        raise VideoExpiredError("缓存文件已被回收")
+
+    if item.get("is_local"):
         from pathlib import Path
 
         if Path(ref).is_file():
             return ref
-        raise VideoError(f"文件已过期或不可访问：{ref}")
+        raise VideoExpiredError(f"本地文件已被清理（{Path(ref).name}）")
 
     # 远程 URL，按需下载（下载前按 max_size_mb 预检大小）
     name = item.get("name", "video")
     dest = await download_video_file(ref, name, max_size_mb=max_size_mb)
     item["ref"] = str(dest)
     item["is_local"] = True
+    item["downloaded"] = True
     return str(dest)

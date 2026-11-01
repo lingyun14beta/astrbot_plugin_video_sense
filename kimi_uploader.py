@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
@@ -92,6 +93,10 @@ async def upload_video_file(
                         info = json.loads(raw)
                     except json.JSONDecodeError as e:
                         raise KimiUploadError(f"上传响应解析失败：{e}") from e
+    except asyncio.TimeoutError as e:
+        raise KimiUploadError(
+            f"上传超时（>{timeout} 秒）：请检查网络或压缩视频后重试。",
+        ) from e
     except aiohttp.ClientError as e:
         raise KimiUploadError(f"网络请求异常：{e}") from e
 

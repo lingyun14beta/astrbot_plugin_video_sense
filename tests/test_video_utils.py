@@ -2,19 +2,26 @@
 
 from __future__ import annotations
 
+import os
+import time
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from video_utils import (
     VideoError,
+    VideoExpiredError,
+    _assert_public_url,
     _get_ext,
+    _open_stream,
+    _prune_temp_files,
     _validate,
     download_video_file,
     load_video,
     load_video_from_path,
     resolve_component_ref,
     video_component_name,
+    video_ref_status,
 )
 
 
@@ -195,64 +202,66 @@ class TestVideoComponent:
         assert result.mime_type == "video/mp4"
 
 
-class TestDownloadVideoFile:
-    def _mock_session(self, payload: bytes, content_length: str | None = None):
-        class MockResp:
-            status = 200
-            headers = {"Content-Length": content_length} if content_length else {}
+class _PatchDownloadEnv:
+    """下载器测试前提：跳过真实 DNS 解析（地址校验另有独立用例）。"""
 
-            async def read(self):
-                return payload
+    @pytest.fixture(autouse=True)
+    def _skip_url_check(self):
+        with patch("video_utils._assert_public_url", new=AsyncMock(return_value=None)):
+            yield
 
-            async def __aenter__(self):
-                return self
 
-            async def __aexit__(self, *args):
-                pass
-
-        class MockSession:
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *args):
-                pass
-
-            def get(self, url):
-                return MockResp()
-
-        return MockSession()
-
-    async def test_download_success(self, temp_dir, sample_video_path):
+class TestDownloadVideoFile(_PatchDownloadEnv):
+    async def test_download_success(
+        self, sample_video_path, response_factory, session_factory
+    ):
         payload = sample_video_path.read_bytes()
-        with patch(
-            "video_utils.aiohttp.ClientSession",
-            return_value=self._mock_session(payload),
-        ):
+        session = session_factory(
+            {"https://example.com/clip.mp4": response_factory(payload)}
+        )
+        with patch("video_utils.aiohttp.ClientSession", return_value=session):
             dest = await download_video_file("https://example.com/clip.mp4", "clip.mp4")
         assert dest.is_file()
         assert dest.read_bytes() == payload
-        assert dest.name == "clip.mp4"
+        assert dest.name.endswith("clip.mp4")
 
-    async def test_sanitizes_unsafe_filename(self, sample_video_path):
+    async def test_filename_has_unique_prefix(
+        self, sample_video_path, response_factory, session_factory
+    ):
+        """同名视频重复下载不再互相覆盖（此前会写到同一个固定路径）。"""
+        payload = sample_video_path.read_bytes()
+        session = session_factory(
+            {"https://example.com/clip.mp4": response_factory(payload)}
+        )
+        with patch("video_utils.aiohttp.ClientSession", return_value=session):
+            first = await download_video_file(
+                "https://example.com/clip.mp4", "clip.mp4"
+            )
+            second = await download_video_file(
+                "https://example.com/clip.mp4", "clip.mp4"
+            )
+        assert first != second
+        assert first.is_file() and second.is_file()
+
+    async def test_sanitizes_unsafe_filename(
+        self, sample_video_path, response_factory, session_factory
+    ):
         """文件名净化：路径分隔符与非法字符必须被剥离/替换（平台无关）。"""
         payload = sample_video_path.read_bytes()
+        session = session_factory(
+            {"https://example.com/clip.mp4": response_factory(payload)}
+        )
 
         # 正斜杠路径：Path.name 在任意平台都剥离目录部分，仅净化非法字符
-        with patch(
-            "video_utils.aiohttp.ClientSession",
-            return_value=self._mock_session(payload),
-        ):
+        with patch("video_utils.aiohttp.ClientSession", return_value=session):
             dest = await download_video_file(
                 "https://example.com/clip.mp4", "../evil/name?.mp4"
             )
-        assert dest.name == "name_.mp4"
+        assert dest.name.endswith("name_.mp4")
 
         # 反斜杠路径（Windows 风格）：在 Linux 上反斜杠不是分隔符，
         # 但净化逻辑必须保证不含路径分隔符（无路径穿越风险）
-        with patch(
-            "video_utils.aiohttp.ClientSession",
-            return_value=self._mock_session(payload),
-        ):
+        with patch("video_utils.aiohttp.ClientSession", return_value=session):
             dest2 = await download_video_file(
                 "https://example.com/clip.mp4", r"..\..\evil:name?.mp4"
             )
@@ -261,52 +270,193 @@ class TestDownloadVideoFile:
         assert ":" not in dest2.name
         assert dest2.name.endswith(".mp4")
 
-    async def test_content_length_too_large(self, sample_video_path):
+    async def test_content_length_too_large(
+        self, sample_video_path, response_factory, session_factory
+    ):
         payload = sample_video_path.read_bytes()
-        mock = self._mock_session(payload, content_length=str(50 * 1024 * 1024))
-        with patch("video_utils.aiohttp.ClientSession", return_value=mock):
+        session = session_factory(
+            {
+                "https://example.com/big.mp4": response_factory(
+                    payload, headers={"Content-Length": str(50 * 1024 * 1024)}
+                )
+            }
+        )
+        with patch("video_utils.aiohttp.ClientSession", return_value=session):
             with pytest.raises(VideoError, match="超过限制"):
                 await download_video_file(
                     "https://example.com/big.mp4", "big.mp4", max_size_mb=20
                 )
 
-    async def test_actual_size_too_large(self, sample_large_video_path):
+    async def test_streaming_cap_without_content_length(
+        self, sample_large_video_path, response_factory, session_factory
+    ):
+        """没有 Content-Length 时也要在流式读取阶段按大小中断。"""
         payload = sample_large_video_path.read_bytes()
-        with patch(
-            "video_utils.aiohttp.ClientSession",
-            return_value=self._mock_session(payload),
-        ):
+        session = session_factory(
+            {"https://example.com/big.mp4": response_factory(payload)}
+        )
+        with patch("video_utils.aiohttp.ClientSession", return_value=session):
             with pytest.raises(VideoError, match="超过限制"):
                 await download_video_file(
                     "https://example.com/big.mp4", "big.mp4", max_size_mb=1
                 )
 
-    async def test_http_error(self):
-        class MockResp:
-            status = 404
-            headers = {}
-
-            async def read(self):
-                return b""
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *args):
-                pass
-
-        class MockSession:
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *args):
-                pass
-
-            def get(self, url):
-                return MockResp()
-
-        with patch("video_utils.aiohttp.ClientSession", return_value=MockSession()):
+    async def test_http_error(self, response_factory, session_factory):
+        session = session_factory(
+            {"https://example.com/missing.mp4": response_factory(b"", status=404)}
+        )
+        with patch("video_utils.aiohttp.ClientSession", return_value=session):
             with pytest.raises(VideoError, match="HTTP 404"):
                 await download_video_file(
                     "https://example.com/missing.mp4", "missing.mp4"
                 )
+
+    async def test_follows_redirect(
+        self, sample_video_path, response_factory, session_factory
+    ):
+        payload = sample_video_path.read_bytes()
+        session = session_factory(
+            {
+                "https://example.com/clip.mp4": response_factory(
+                    b"", status=302, headers={"Location": "/real.mp4"}
+                ),
+                "https://example.com/real.mp4": response_factory(payload),
+            }
+        )
+        with patch("video_utils.aiohttp.ClientSession", return_value=session):
+            dest = await download_video_file(
+                "https://example.com/clip.mp4", "clip.mp4"
+            )
+        assert dest.read_bytes() == payload
+
+    async def test_too_many_redirects(self, response_factory, session_factory):
+        session = session_factory(
+            {
+                "https://example.com/a.mp4": response_factory(
+                    b"", status=302, headers={"Location": "/b.mp4"}
+                ),
+                "https://example.com/b.mp4": response_factory(
+                    b"", status=302, headers={"Location": "/c.mp4"}
+                ),
+                "https://example.com/c.mp4": response_factory(
+                    b"", status=302, headers={"Location": "/d.mp4"}
+                ),
+                "https://example.com/d.mp4": response_factory(
+                    b"", status=302, headers={"Location": "/e.mp4"}
+                ),
+            }
+        )
+        with patch("video_utils.aiohttp.ClientSession", return_value=session):
+            with pytest.raises(VideoError, match="重定向次数过多"):
+                await download_video_file("https://example.com/a.mp4", "a.mp4")
+
+
+class TestAssertPublicUrl:
+    async def test_allows_public_ip(self):
+        await _assert_public_url("https://93.184.216.34/clip.mp4")
+
+    async def test_rejects_non_http_scheme(self):
+        with pytest.raises(VideoError, match="不支持的下载协议"):
+            await _assert_public_url("file:///etc/passwd")
+
+    async def test_rejects_localhost(self):
+        with pytest.raises(VideoError, match="本机或内网"):
+            await _assert_public_url("http://localhost:8000/clip.mp4")
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://127.0.0.1/clip.mp4",
+            "http://10.1.2.3/clip.mp4",
+            "http://192.168.1.10/clip.mp4",
+            "http://169.254.169.254/latest/meta-data",
+            "http://[::1]/clip.mp4",
+        ],
+    )
+    async def test_rejects_private_ip_literal(self, url):
+        with pytest.raises(VideoError, match="内网或保留地址"):
+            await _assert_public_url(url)
+
+    async def test_rejects_hostname_resolving_to_private_ip(self):
+        with patch(
+            "socket.getaddrinfo",
+            return_value=[(2, 1, 6, "", ("192.168.1.10", 0))],
+        ):
+            with pytest.raises(VideoError, match="解析到内网"):
+                await _assert_public_url("https://internal.example.com/clip.mp4")
+
+    async def test_rejects_missing_host(self):
+        with pytest.raises(VideoError, match="缺少主机名"):
+            await _assert_public_url("https:///clip.mp4")
+
+
+class TestOpenStreamRejectsPrivateRedirect:
+    async def test_redirect_to_private_ip_is_rejected(
+        self, response_factory, session_factory
+    ):
+        session = session_factory(
+            {
+                "https://93.184.216.34/a.mp4": response_factory(
+                    b"", status=302, headers={"Location": "http://127.0.0.1/b.mp4"}
+                )
+            }
+        )
+        with pytest.raises(VideoError, match="内网或保留地址"):
+            await _open_stream(session, "https://93.184.216.34/a.mp4")
+
+
+class TestPruneTempFiles:
+    def test_removes_old_files_keeps_new(self, temp_dir):
+        old = temp_dir / "old.mp4"
+        new = temp_dir / "new.mp4"
+        old.write_bytes(b"x")
+        new.write_bytes(b"x")
+        past = time.time() - 48 * 3600
+        os.utime(old, (past, past))
+
+        _prune_temp_files(temp_dir)
+
+        assert not old.exists()
+        assert new.exists()
+
+
+class TestVideoRefStatus:
+    def test_empty_ref_is_expired(self):
+        usable, reason = video_ref_status({"ref": "", "is_local": False})
+        assert usable is False
+        assert "回收" in reason
+
+    def test_missing_local_file_is_expired(self, temp_dir):
+        usable, reason = video_ref_status(
+            {"ref": str(temp_dir / "gone.mp4"), "is_local": True}
+        )
+        assert usable is False
+        assert "清理" in reason
+
+    def test_existing_local_file_is_usable(self, sample_video_path):
+        usable, reason = video_ref_status(
+            {"ref": str(sample_video_path), "is_local": True}
+        )
+        assert usable is True
+        assert reason == ""
+
+    def test_remote_ref_is_not_probed(self):
+        """远程链接不做网络探测，避免 list 时发请求；真正过期在下载时报。"""
+        usable, reason = video_ref_status(
+            {"ref": "https://example.com/a.mp4", "is_local": False}
+        )
+        assert usable is True
+        assert reason == ""
+
+
+class TestDownloadExpiredLink:
+    async def test_403_raises_expired_error(self, response_factory, session_factory):
+        session = session_factory(
+            {"https://example.com/x.mp4": response_factory(b"", status=403)}
+        )
+        with (
+            patch("video_utils.aiohttp.ClientSession", return_value=session),
+            patch("video_utils._assert_public_url", new=AsyncMock(return_value=None)),
+        ):
+            with pytest.raises(VideoExpiredError, match="已过期"):
+                await download_video_file("https://example.com/x.mp4", "x.mp4")

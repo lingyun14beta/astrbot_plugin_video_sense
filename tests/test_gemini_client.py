@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from unittest.mock import AsyncMock, patch
 
@@ -1217,3 +1218,97 @@ class TestUploadFile:
         p.write_bytes(b"\x00" * 64)
         with pytest.raises(GeminiClientError, match="不支持"):
             await client.upload_file(str(p), "video/mp4", "clip.mp4")
+
+
+class TestCompressedMime:
+    """压缩产物恒为 mp4：请求里的 mime 必须是 video/mp4，而不是源格式。"""
+
+    async def test_compressed_uses_mp4_mime(self, tmp_path):
+        from ffmpeg_utils import CompressResult
+
+        src = tmp_path / "clip.flv"
+        src.write_bytes(b"\x00" * (2 * 1024 * 1024))
+        video = type(
+            "Video",
+            (),
+            {
+                "path": str(src),
+                "mime_type": "video/x-flv",
+                "filename": "clip.flv",
+                "size_bytes": src.stat().st_size,
+            },
+        )()
+
+        client = GeminiClient(
+            api_key="k",
+            model="qwen-vl-max",
+            system_prompt="s",
+            base_url="https://proxy.example.com/v1",
+            max_inline_size_mb=1,
+            compress=True,
+        )
+        compressed = tmp_path / "compressed.mp4"
+        compressed.write_bytes(b"\x00" * 512)
+
+        with (
+            patch("gemini_client.find_ffmpeg", return_value="/usr/bin/ffmpeg"),
+            patch(
+                "gemini_client.compress_video",
+                new=AsyncMock(
+                    return_value=CompressResult(
+                        path=str(compressed), size_bytes=512, attempts=1
+                    )
+                ),
+            ),
+        ):
+            client.analyze = AsyncMock(return_value="ok")
+            await client.analyze_video(video)
+
+        assert client.analyze.await_args.args[1] == "video/mp4"
+
+
+class TestTimeoutHandling:
+    """aiohttp 总超时抛的是 asyncio.TimeoutError，必须转成 GeminiClientError。"""
+
+    class _TimeoutCM:
+        async def __aenter__(self):
+            raise asyncio.TimeoutError()
+
+        async def __aexit__(self, *args):
+            return False
+
+    class _Session:
+        closed = False
+
+        def post(self, *args, **kwargs):
+            return TestTimeoutHandling._TimeoutCM()
+
+        def put(self, *args, **kwargs):
+            return TestTimeoutHandling._TimeoutCM()
+
+        def get(self, *args, **kwargs):
+            return TestTimeoutHandling._TimeoutCM()
+
+    def _client(self):
+        client = GeminiClient(
+            api_key="k",
+            model="gemini-2.0-flash",
+            system_prompt="s",
+            timeout=5,
+        )
+        client._session = self._Session()
+        return client
+
+    async def test_post_timeout_becomes_client_error(self):
+        with pytest.raises(GeminiClientError, match="请求超时"):
+            await self._client()._post("https://example.com", {}, {})
+
+    async def test_upload_timeout_becomes_client_error(self, tmp_path):
+        p = tmp_path / "clip.mp4"
+        p.write_bytes(b"\x00" * 64)
+        with pytest.raises(GeminiClientError, match="上传初始化超时"):
+            await self._client().upload_file(str(p), "video/mp4")
+
+    async def test_file_status_timeout_becomes_client_error(self):
+        with pytest.raises(GeminiClientError, match="查询文件处理状态超时"):
+            await self._client()._wait_file_active("files/1", "uri1")

@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
@@ -151,6 +152,10 @@ async def upload_video_to_temp_url(
                     if resp.status != _HTTP_OK:
                         msg = _extract_error_message(raw) or f"HTTP {resp.status}"
                         raise QwenUploadError(f"上传文件失败（{resp.status}）：{msg}")
+    except asyncio.TimeoutError as e:
+        raise QwenUploadError(
+            f"上传超时（>{timeout} 秒）：请检查网络或压缩视频后重试。",
+        ) from e
     except aiohttp.ClientError as e:
         raise QwenUploadError(f"网络请求异常：{e}") from e
 

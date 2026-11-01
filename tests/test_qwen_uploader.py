@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from unittest.mock import patch
 
@@ -250,6 +251,41 @@ class TestUploadVideoToTempUrl:
         )
         with self._patch_session(_FakeResp(json_data=_POLICY), post_resp):
             with pytest.raises(QwenUploadError, match="上传文件失败（500）"):
+                await upload_video_to_temp_url(
+                    "sk-test",
+                    "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                    "qwen-vl-max",
+                    str(sample_video_path),
+                    "video/mp4",
+                )
+
+
+class TestUploadTimeout:
+    """上传超时（asyncio.TimeoutError）必须转成 QwenUploadError。"""
+
+    async def test_timeout_maps_to_upload_error(self, sample_video_path):
+        class _TimeoutCM:
+            async def __aenter__(self):
+                raise asyncio.TimeoutError()
+
+            async def __aexit__(self, *args):
+                return False
+
+        class _Session:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            def get(self, *args, **kwargs):
+                return _TimeoutCM()
+
+            def post(self, *args, **kwargs):
+                return _TimeoutCM()
+
+        with patch("qwen_uploader.aiohttp.ClientSession", return_value=_Session()):
+            with pytest.raises(QwenUploadError, match="上传超时"):
                 await upload_video_to_temp_url(
                     "sk-test",
                     "https://dashscope.aliyuncs.com/compatible-mode/v1",
