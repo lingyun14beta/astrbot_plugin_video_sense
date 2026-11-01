@@ -31,6 +31,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - run: pip install pytest pytest-asyncio aiohttp
+      # pydantic 是 AstrBot 的运行时依赖，唤醒交付测试用它打桩 SendMessageToUserTool
+      - run: pip install pytest pytest-asyncio aiohttp "pydantic>=2"
 
       - run: python -m pytest tests -v --tb=short
