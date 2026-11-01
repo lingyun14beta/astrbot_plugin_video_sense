@@ -54,8 +54,8 @@ _ERROR_PREFIXES = ("文件处理失败", "视频分析失败")
 _MAX_CONCURRENT_ANALYSES = 2
 # 待注入的"视频感知"提示最多保留多少条，防止 LLM 长期不响应时无限累积
 _MAX_PENDING_HINTS = 10
-# 唤醒主 Agent 的最多步数：只需一次工具调用把结果发出去
-_WAKE_MAX_STEPS = 5
+# 唤醒主 Agent 的最多步数：正常一次工具调用即可，留些余量给模型纠错
+_WAKE_MAX_STEPS = 10
 # 单会话条目上限的默认值（可在配置里改，见 analysis.max_entries_per_session）
 _DEFAULT_MAX_ENTRIES_PER_SESSION = 50
 # 缓存落盘：文件名与合并写入的窗口
@@ -71,65 +71,43 @@ _EXPIRED_TOOL_HINT = (
     "不要重复调用本工具，也不要改用其他序号。"
 )
 
-# 插件自己的发送工具参数表（名称与框架内置工具一致，避免改提示词）
-_SEND_MESSAGE_TOOL_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "messages": {
-            "type": "array",
-            "description": "要发送的消息列表，type=plain 时取用 text 字段。",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "type": {
-                        "type": "string",
-                        "description": "消息类型，固定为 plain。",
-                    },
-                    "text": {
-                        "type": "string",
-                        "description": "要发送的文本内容。",
-                    },
-                },
-                "required": ["type"],
-            },
-        },
-    },
-    "required": ["messages"],
-}
 
+def _make_delivery_tool():
+    """构造带投递记账的 ``send_message_to_user``（核心工具的子类）。
 
-def _build_text_chain(messages) -> MessageChain | None:
-    """把 send_message_to_user 的 messages 参数转成只含文本的 MessageChain。
-
-    Args:
-        messages: 工具参数里的消息数组（也接受单个字符串）。
+    发送行为完全复用核心实现（文本/图片/文件、工作区路径映射等），这里只额外
+    记录"这一轮是否真的发出去"，并拒绝同一轮内重复发送相同内容。
 
     Returns:
-        含文本的消息链；没有任何可发送文本时返回 None。
+        工具实例；调用成功后其 ``delivered`` 为 True。
     """
-    if isinstance(messages, str):
-        messages = [{"type": "plain", "text": messages}]
+    from astrbot.core.tools.message_tools import SendMessageToUserTool
+    from pydantic import Field
+    from pydantic.dataclasses import dataclass as pydantic_dataclass
 
-    texts: list[str] = []
-    for item in messages or []:
-        if isinstance(item, str):
-            if item.strip():
-                texts.append(item)
-            continue
-        if not isinstance(item, dict):
-            continue
-        if str(item.get("type") or "plain").lower() not in ("plain", "text"):
-            continue
-        text = item.get("text")
-        if isinstance(text, str) and text.strip():
-            texts.append(text)
+    @pydantic_dataclass
+    class _DeliverySendMessageToUserTool(SendMessageToUserTool):
+        delivered: bool = False
+        sent_signatures: list[str] = Field(default_factory=list)
 
-    if not texts:
-        return None
-    chain = MessageChain()
-    for text in texts:
-        chain.message(text)
-    return chain
+        async def call(self, context, **kwargs):
+            messages = kwargs.get("messages")
+            signature = json.dumps(
+                messages, ensure_ascii=False, sort_keys=True, default=str
+            )
+            if signature in self.sent_signatures:
+                return (
+                    "error: this content was already sent to the user in this turn; "
+                    "do not send it again."
+                )
+            result = await super().call(context, **kwargs)
+            if isinstance(result, str) and result.lstrip().startswith("error"):
+                return result
+            self.sent_signatures.append(signature)
+            self.delivered = True
+            return result
+
+    return _DeliverySendMessageToUserTool()
 
 
 def _is_error(text: str) -> bool:
@@ -544,34 +522,46 @@ class VideoSensePlugin(Star):
         return True
 
     async def _deliver_result(self, umo: str, result_text: str) -> None:
-        """交付分析结果：优先唤醒 AI 以角色口吻发送，失败兜底直接发送。"""
+        """交付分析结果：唤醒 AI 以角色口吻发送；仅在唤醒轮异常时兜底直发。
+
+        与 image_generation 的语义对齐：AI 正常结束但没有调用发送工具，视为它的
+        判断（例如它认为这一步不需要打扰用户），不再代发原始分析文本。
+        """
         try:
             sent = await self._wake_ai_for_result(umo, result_text)
         except Exception as e:
             logger.warning("[VideoSense] 唤醒 AI 发送失败，改为直接发送：%s", e)
-            sent = False
-        if not sent:
             await self._safe_send(umo, result_text)
+            return
+        if not sent:
+            logger.warning(
+                "[VideoSense] 唤醒轮未投递分析结果（AI 未调用 send_message_to_user），"
+                "按 AI 判断不代发原文",
+            )
 
     async def _wake_ai_for_result(self, umo: str, result_text: str) -> bool:
-        """唤醒主 Agent 处理视频分析结果（借鉴 image_generation 的任务完成唤醒机制）。
+        """唤醒主 Agent，用角色口吻把分析结果投递给用户。
 
-        构造一次带完整会话上下文的主动 Agent 回合，让 LLM 用角色口吻
-        把结果发送给用户。
-
-        发送工具由插件自己提供（沿用框架工具的 name，参数表见
-        ``_SEND_MESSAGE_TOOL_SCHEMA``）：工具真正调用成功才把 delivered 置位，
-        因此不再依赖上游工具返回的界面文案，也不会因上游改文案而判定失败、
-        把同一份结果重复发送两遍。
+        与 image_generation 的唤醒实现对齐：
+        - 会话历史直接放进 ``req.contexts``，不再压进 system prompt（保留 provider
+          的前缀缓存），分析结果作为额外的用户内容块传入；
+        - 发送工具用核心 ``send_message_to_user`` 的子类，成功与否以核心工具返回值
+          （``error:`` 前缀）为准，并记录是否真的投递；
+        - 保留 build_main_agent 合并出来的完整工具集，只把同名发送工具换成带记账的
+          变体（必须在 reset_coro 之前替换，reset 持有同一个 request 对象）。
 
         Args:
             umo: 会话标识。
             result_text: 待交付的分析结果（或失败原因）。
 
         Returns:
-            AI 是否成功把消息发给了用户。
+            AI 是否真的把消息发给了用户。
+
+        Raises:
+            RuntimeError: 无法构建主 Agent（例如没有可用的对话模型）。
         """
-        from astrbot.core.agent.tool import FunctionTool, ToolSet
+        from astrbot.core.agent.message import TextPart
+        from astrbot.core.agent.tool import ToolSet
         from astrbot.core.astr_main_agent import (
             MainAgentBuildConfig,
             _get_session_conv,
@@ -585,11 +575,11 @@ class VideoSensePlugin(Star):
             "你是一个自主 Agent。你被唤醒是因为之前提交的视频分析任务已完成。\n"
             "# 重要规则\n"
             "1. 这不是普通对话回合，不要寒暄，不要提问。\n"
-            "2. 你必须使用 send_message_to_user 工具把分析结果发送给用户，否则用户看不到。\n"
+            "2. send_message_to_user 是这里唯一能把内容送到用户面前的通道："
+            "你的最终回复文本不会被发送。\n"
             "3. 用你平时的角色口吻组织语言（保持人设），但不要改变事实内容。\n"
             "4. 如果任务失败，用角色口吻简要说明失败原因。\n"
-            "# 视频分析结果\n"
-            f"{result_text}"
+            "5. 不要再调用视频分析工具（视频已经分析完），也不要把同一段内容发送两次。\n"
         )
 
         session = MessageSession.from_str(umo)
@@ -606,6 +596,7 @@ class VideoSensePlugin(Star):
         provider_settings = cfg.get("provider_settings", {})
         tool_call_timeout = provider_settings.get("tool_call_timeout", 120)
         provider = self.context.get_using_provider(umo)
+        delivery_tool = _make_delivery_tool()
 
         req = ProviderRequest()
         req.conversation = await _get_session_conv(
@@ -615,37 +606,19 @@ class VideoSensePlugin(Star):
         history_context = json.loads(req.conversation.history or "[]")
         if history_context:
             req.contexts = history_context
-            context_dump = req._print_friendly_context()
-            req.contexts = []
-            req.system_prompt += (
-                f"\n\n以下是你和用户之前的对话历史：\n---\n{context_dump}\n---\n"
-            )
         req.system_prompt += system_prompt
-        req.prompt = "请按系统指令把视频分析结果发送给用户。"
-
-        delivered = {"sent": False}
-
-        async def _send_message_tool(event, **kwargs) -> str:
-            chain = _build_text_chain(kwargs.get("messages"))
-            if chain is None:
-                return "未发送：messages 为空或不含可发送的文本内容。"
-            if not await self.context.send_message(umo, chain):
-                return "未发送：找不到对应的平台会话。"
-            delivered["sent"] = True
-            return "已发送给用户。"
-
-        send_tool = FunctionTool(
-            name="send_message_to_user",
-            description=(
-                "把消息发送给用户。messages 为消息数组，"
-                '每项形如 {"type": "plain", "text": "要发送的文字"}。'
-            ),
-            parameters=_SEND_MESSAGE_TOOL_SCHEMA,
-            handler=_send_message_tool,
+        req.prompt = (
+            "请按系统指令把视频分析结果发送给用户；如果本轮不需要发送，直接结束即可。"
         )
-
+        req.extra_user_content_parts.append(
+            TextPart(
+                text=(
+                    f"<video_analysis_result>\n{result_text}\n</video_analysis_result>"
+                ),
+            ),
+        )
         req.func_tool = ToolSet()
-        req.func_tool.add_tool(send_tool)
+        req.func_tool.add_tool(delivery_tool)
 
         config = MainAgentBuildConfig(
             tool_call_timeout=tool_call_timeout,
@@ -664,18 +637,65 @@ class VideoSensePlugin(Star):
             apply_reset=False,
         )
         if not result:
-            return False
+            raise RuntimeError("无法构建主 Agent（可能没有可用的对话模型）")
 
-        # 裁剪工具：本次主动回合只允许发送消息
-        result.provider_request.func_tool = ToolSet()
-        result.provider_request.func_tool.add_tool(send_tool)
+        # build 会把 persona/插件工具集合并进来，其中核心的同名 send_message_to_user
+        # 会覆盖变体；这里换回带记账的版本，必须在 reset 之前完成。
+        result.provider_request.func_tool.add_tool(delivery_tool)
         if result.reset_coro:
             await result.reset_coro
 
         async for _resp in result.agent_runner.step_until_done(_WAKE_MAX_STEPS):
-            if delivered["sent"]:
-                break
-        return delivered["sent"]
+            # 是否发送、发送什么由 AI 决定，本轮不代它发送任何内容。
+            pass
+
+        await self._record_wake_note(
+            umo=umo,
+            conversation=req.conversation,
+            runner=result.agent_runner,
+            delivered=delivery_tool.delivered,
+        )
+        return delivery_tool.delivered
+
+    async def _record_wake_note(
+        self,
+        *,
+        umo: str,
+        conversation,
+        runner,
+        delivered: bool,
+    ) -> None:
+        """把唤醒轮的投递状态与 AI 文本写回会话历史，供后续轮次参考。"""
+        manager = getattr(self.context, "conversation_manager", None)
+        if manager is None or conversation is None:
+            return
+        try:
+            latest = await manager.get_conversation(umo, conversation.cid)
+            raw = getattr(latest, "history", None) or "[]"
+            try:
+                history = json.loads(raw)
+            except (TypeError, ValueError):
+                history = []
+            if not isinstance(history, list):
+                history = []
+            llm_resp = runner.get_final_llm_resp()
+            note = f"[VideoSenseTask] delivered={str(delivered).lower()}"
+            if llm_resp is not None and llm_resp.completion_text:
+                note += f" AI response: {llm_resp.completion_text}"
+            history.append({"role": "assistant", "content": note})
+            token_usage = (
+                llm_resp.usage.total
+                if llm_resp is not None and llm_resp.usage
+                else None
+            )
+            await manager.update_conversation(
+                umo,
+                conversation.cid,
+                history=history,
+                token_usage=token_usage,
+            )
+        except Exception:
+            logger.warning("[VideoSense] 写入唤醒轮历史记录失败", exc_info=True)
 
     async def _safe_send(self, umo: str, text: str) -> None:
         """向会话主动发送文本，失败仅记日志（不中断后台任务）。"""

@@ -6,7 +6,7 @@ version: v0.8.0
 author: lingyun
 repo: https://github.com/lingyun14beta/astrbot_plugin_video_sense
 social_link: https://github.com/lingyun14beta
-astrbot_version: ">=4.16"
+astrbot_version: ">=4.25"
 tags:
   - video
   - multimodal

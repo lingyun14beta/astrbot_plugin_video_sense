@@ -307,31 +307,6 @@ class TestFormatVideoList:
         assert "2. b.mp4（1小时前）" in text
 
 
-class TestBuildTextChain:
-    """把 send_message_to_user 的 messages 参数转成只含文本的消息链。"""
-
-    def test_plain_messages_are_joined(self):
-        chain = _main._build_text_chain(
-            [{"type": "plain", "text": "a"}, {"type": "plain", "text": "b"}]
-        )
-        assert chain.chain == ["a", "b"]
-
-    def test_accepts_plain_string(self):
-        chain = _main._build_text_chain("只有一段话")
-        assert chain.chain == ["只有一段话"]
-
-    def test_skips_non_plain_components(self):
-        chain = _main._build_text_chain(
-            [{"type": "image", "path": "x.png"}, {"type": "plain", "text": "说明"}]
-        )
-        assert chain.chain == ["说明"]
-
-    def test_returns_none_for_empty(self):
-        assert _main._build_text_chain([]) is None
-        assert _main._build_text_chain(None) is None
-        assert _main._build_text_chain([{"type": "plain", "text": "   "}]) is None
-
-
 class TestBackgroundDedupe:
     """同一视频的并发提交只跑一次；不同视频各自执行。"""
 
@@ -369,7 +344,8 @@ class TestBackgroundDedupe:
 
         assert seen == ["first"]
         assert plugin._inflight == {}
-        send.assert_awaited_once()
+        # 唤醒轮返回 False（AI 选择不发送）时不再兜底发原文
+        send.assert_not_awaited()
 
     async def test_different_keys_run_both(self):
         plugin, _ = self._make_plugin()
