@@ -19,3 +19,6 @@ ignore = [
   "ASYNC230", # TODO: handle ASYNC230
   "ASYNC240", # 本地文件元数据检查（is_file/stat），阻塞可忽略；与 AstrBot 官方配置一致
 ]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

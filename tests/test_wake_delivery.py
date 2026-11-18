@@ -255,6 +255,115 @@ class TestWakeDelivery:
             await plugin._wake_ai_for_result("umo:1", "分析结果")
 
 
+class _FakeRun:
+    """``AgentRun`` 的最小替身：可重放 output.ready，并给出终态结果。"""
+
+    def __init__(self, status="completed", content=(), sources=()) -> None:
+        self._status = status
+        self._content = tuple(content)
+        self._sources = list(sources)
+        self.cancelled = False
+
+    async def events(self):
+        for source in self._sources:
+            yield SimpleNamespace(
+                type="output.ready", payload=SimpleNamespace(source=source)
+            )
+
+    async def result(self):
+        return SimpleNamespace(status=self._status, content=self._content)
+
+    async def cancel(self):
+        self.cancelled = True
+
+
+class _FakeAgentService:
+    """``ctx.agent`` 替身，记录 run_turn 的入参。"""
+
+    def __init__(self, run) -> None:
+        self.run = run
+        self.calls: list[dict] = []
+
+    async def run_turn(self, **kwargs):
+        self.calls.append(kwargs)
+        return self.run
+
+
+@pytest.fixture
+def agent_sdk(monkeypatch):
+    """打桩 4.30+ 的公开 SDK（``astrbot.api.agents``）。"""
+    module = ModuleType("astrbot.api.agents")
+    module.PlainInput = lambda text: SimpleNamespace(text=text)
+
+    class _TurnStatus:
+        COMPLETED = "completed"
+
+    module.TurnStatus = _TurnStatus
+    monkeypatch.setitem(sys.modules, "astrbot.api.agents", module)
+    return module
+
+
+def _make_new_runtime_plugin(run):
+    agent = _FakeAgentService(run)
+    send = AsyncMock(return_value=True)
+    context = SimpleNamespace(agent=agent, send_message=send)
+    return _main.VideoSensePlugin(context=context, config={}), agent, send
+
+
+class TestRunTurnCompat:
+    """4.30+：走 ctx.agent.run_turn，由框架负责投递。"""
+
+    async def test_uses_run_turn_and_reports_delivery(self, agent_sdk):
+        plugin, agent, send = _make_new_runtime_plugin(_FakeRun(sources=["reply"]))
+
+        assert await plugin._wake_ai_for_result("umo:1", "分析结果") is True
+
+        call = agent.calls[0]
+        assert call["umo"] == "umo:1"
+        assert call["send_to_user"] is True
+        prompt = call["input_message"][0].text
+        assert "视频分析任务已完成" in prompt
+        assert "分析结果" in prompt
+        send.assert_not_awaited()
+
+    async def test_tool_output_counts_as_delivery(self, agent_sdk):
+        plugin, _, _ = _make_new_runtime_plugin(_FakeRun(sources=["tool"]))
+
+        assert await plugin._wake_ai_for_result("umo:1", "分析结果") is True
+
+    async def test_returns_false_when_no_output(self, agent_sdk):
+        plugin, _, _ = _make_new_runtime_plugin(_FakeRun())
+
+        assert await plugin._wake_ai_for_result("umo:1", "分析结果") is False
+
+    async def test_failed_turn_returns_false(self, agent_sdk):
+        plugin, _, _ = _make_new_runtime_plugin(
+            _FakeRun(status="failed", content=("降级文本",), sources=["reply"])
+        )
+
+        assert await plugin._wake_ai_for_result("umo:1", "分析结果") is False
+
+    async def test_deliver_result_falls_back_when_run_turn_raises(self, agent_sdk):
+        plugin, _, send = _make_new_runtime_plugin(_FakeRun())
+        plugin._wake_ai_run_turn = AsyncMock(side_effect=RuntimeError("运行时不可用"))
+
+        await plugin._deliver_result("umo:1", "原始分析")
+
+        send.assert_awaited_once()
+        assert "原始分析" in str(send.await_args.args[1])
+
+
+class TestWakeDispatch:
+    async def test_falls_back_to_legacy_without_agent_service(self):
+        plugin, _, _, _ = _make_plugin()
+        plugin._wake_ai_legacy = AsyncMock(return_value=True)
+        plugin._wake_ai_run_turn = AsyncMock(return_value=False)
+
+        assert await plugin._wake_ai_for_result("umo:1", "分析结果") is True
+        plugin._wake_ai_legacy.assert_awaited_once_with("umo:1", "分析结果")
+        plugin._wake_ai_run_turn.assert_not_awaited()
+
+
 class TestDeliverResult:
     async def test_exception_falls_back_to_raw_send(self):
         plugin, send, _, _ = _make_plugin()

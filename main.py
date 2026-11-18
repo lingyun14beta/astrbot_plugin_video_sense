@@ -114,6 +114,19 @@ def _is_error(text: str) -> bool:
     return text.startswith(_ERROR_PREFIXES)
 
 
+def _supports_agent_run_turn(context) -> bool:
+    """判断宿主是否提供 4.30+ 的主动 Agent 入口 ``ctx.agent.run_turn``。
+
+    Args:
+        context: 插件持有的 AstrBot ``Context``。
+
+    Returns:
+        有该入口时走新版公开 API；没有则回退到 4.25–4.29 的内部接口。
+    """
+    agent = getattr(context, "agent", None)
+    return callable(getattr(agent, "run_turn", None))
+
+
 def _reclaim_item(item: dict) -> str | None:
     """回收插件自己下载的临时文件，返回待删除路径（适配器临时文件不归我们删）。"""
     if not item.get("downloaded"):
@@ -540,6 +553,79 @@ class VideoSensePlugin(Star):
             )
 
     async def _wake_ai_for_result(self, umo: str, result_text: str) -> bool:
+        """唤醒主 Agent，用角色口吻把分析结果投递给用户。
+
+        按宿主版本选择实现：4.30+ 走公开的 ``ctx.agent.run_turn``，更早的版本
+        回退到内部 ``build_main_agent`` 流程。
+
+        Args:
+            umo: 会话标识。
+            result_text: 待交付的分析结果（或失败原因）。
+
+        Returns:
+            AI 是否真的把消息发给了用户。
+        """
+        if _supports_agent_run_turn(self.context):
+            return await self._wake_ai_run_turn(umo, result_text)
+        return await self._wake_ai_legacy(umo, result_text)
+
+    async def _wake_ai_run_turn(self, umo: str, result_text: str) -> bool:
+        """4.30+：交给 ``ctx.agent.run_turn`` 唤醒主 Agent，由框架负责投递。
+
+        与旧版内部实现相比，这里不再手工构造事件、``ProviderRequest`` 和 runner：
+        ``run_turn`` 沿用该会话的人格、历史、工具与 hooks；``send_to_user=True``
+        时框架自动呈现最终回复（``send_message_to_user`` 仍可用，重复内容由框架去重）。
+
+        Args:
+            umo: 会话标识。
+            result_text: 待交付的分析结果（或失败原因）。
+
+        Returns:
+            本轮是否真的向用户投递了内容。
+
+        Raises:
+            RuntimeError: Agent 服务或所选运行时不可用。
+            ValueError: 目标会话的平台适配器不存在。
+        """
+        from astrbot.api.agents import PlainInput, TurnStatus
+
+        prompt = (
+            "<system_reminder>\n"
+            "[VideoSense] 视频分析任务已完成（插件后台任务，不是用户发来的新消息）。\n"
+            "请用你平时的角色口吻把结果直接回复给用户，不要寒暄、不要提问，"
+            "也不要重复调用视频分析工具。\n"
+            "如果任务失败，用角色口吻简要说明失败原因。\n"
+            "你的最终回复会自动发送给用户，不需要再调用 send_message_to_user。\n"
+            f"<video_analysis_result>\n{result_text}\n</video_analysis_result>\n"
+            "</system_reminder>"
+        )
+        run = await self.context.agent.run_turn(
+            umo=umo,
+            input_message=[PlainInput(text=prompt)],
+            send_to_user=True,
+        )
+        delivered = False
+        try:
+            events = getattr(run, "events", None)
+            if callable(events):
+                async for agent_event in events():
+                    if getattr(agent_event, "type", "") != "output.ready":
+                        continue
+                    payload = getattr(agent_event, "payload", None)
+                    if getattr(payload, "source", "") in ("reply", "tool"):
+                        delivered = True
+            result = await run.result()
+        except asyncio.CancelledError:
+            try:
+                await run.cancel()
+            except Exception:
+                logger.debug("[VideoSense] 取消唤醒轮失败", exc_info=True)
+            raise
+        if getattr(result, "status", None) != TurnStatus.COMPLETED:
+            return False
+        return delivered or bool(getattr(result, "content", None))
+
+    async def _wake_ai_legacy(self, umo: str, result_text: str) -> bool:
         """唤醒主 Agent，用角色口吻把分析结果投递给用户。
 
         与 image_generation 的唤醒实现对齐：
