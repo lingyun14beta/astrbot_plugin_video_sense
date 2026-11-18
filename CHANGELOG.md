@@ -2,6 +2,21 @@
 
 所有重要变更记录于此。版本号与 [metadata.yaml](metadata.yaml) 保持一致。
 
+## [0.9.0] - 2026-11-16
+
+### 新增
+
+- **兼容 AstrBot 4.30**：唤醒交付按宿主能力自动分流。4.30+ 改走公开的 `ctx.agent.run_turn()`（沿用该会话的人格、历史、工具与 Agent hooks，`send_to_user=True` 时由框架投递并负责同文本去重）；4.25–4.29 继续使用原有的 `build_main_agent` 内部流程，行为不变。
+- 4.30 路径通过 `run.events()` 的 `output.ready` 判断本轮是否真的产出了内容：AI 正常结束但没投递时仍不代发原文，只有唤醒轮异常或失败才兜底直发。
+
+### 变更
+
+- 唤醒判定不再依赖 4.30 中已迁移的内部模块（`astrbot.core.astr_main_agent`、`astrbot.core.cron.events`、`astrbot.core.tools.message_tools`），旧版本走旧导入、新版本走公开 API。
+
+### 测试
+
+- 新增 4.30 路径用例（`run_turn` 入参、`output.ready` 交付判定、失败终态、异常兜底、无 Agent 服务时回退旧流程），共 257 个用例。
+
 ## [0.8.1] - 2026-11-01
 
 ### 变更
